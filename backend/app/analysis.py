@@ -4,12 +4,14 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+import soundfile as sf
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 DRUM_PITCH = {"kick": 36, "snare": 38, "hihat": 42}
-STEM_NAMES = {"bass": "Baixo", "other": "Instrumentos", "vocals": "Voz"}
+STEMS = ("drums", "bass", "vocals", "guitar", "piano", "other")
+LABELS = {"bass": "Baixo", "vocals": "Voz", "guitar": "Guitarra / violão", "piano": "Piano / teclas", "other": "Outros", "drums": "Bateria", "mix": "Mix completo"}
 
 
 def detect_bpm(y, sr):
@@ -30,19 +32,32 @@ def detect_key(y, sr):
     return f"{NOTE_NAMES[best[1]]} {best[2]}"
 
 
-def separate_stems(path: Path, out_dir: Path) -> dict[str, Path]:
-    """Usa o Demucs se estiver instalado. Sem ele, devolve vazio."""
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "demucs", "-n", "htdemucs", "-o", str(out_dir), str(path)],
-            check=True,
-            capture_output=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return {}
-    folder = out_dir / "htdemucs" / path.stem
-    stems = {n: folder / f"{n}.wav" for n in ("drums", "bass", "other", "vocals")}
-    return {n: p for n, p in stems.items() if p.exists()}
+def to_wav(path: Path, out: Path):
+    y, sr = librosa.load(str(path), sr=44100, mono=False)
+    if y.ndim == 1:
+        y = np.stack([y, y])
+    sf.write(str(out), y.T, sr)
+
+
+def separate_stems(path: Path, out_dir: Path):
+    """Separa com Demucs (6 stems). Devolve (stems, erro)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wav = out_dir / "input.wav"
+    to_wav(path, wav)
+    proc = subprocess.run(
+        [sys.executable, "-m", "demucs", "-n", "htdemucs_6s", "-o", str(out_dir), str(wav)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr or proc.stdout or ""
+        if "No module named demucs" in err:
+            return {}, "Demucs não está instalado"
+        lines = err.strip().splitlines()
+        return {}, lines[-1] if lines else "erro desconhecido"
+    folder = out_dir / "htdemucs_6s" / "input"
+    stems = {n: folder / f"{n}.wav" for n in STEMS if (folder / f"{n}.wav").exists()}
+    return stems, (None if stems else "O Demucs não gerou arquivos")
 
 
 def transcribe(path: Path):
@@ -98,21 +113,21 @@ def analyze_file(path: Path, work_dir: Path):
     key = detect_key(y, sr)
     duration = round(float(len(y) / sr), 2)
 
-    stems = separate_stems(path, work_dir)
+    stems, sep_error = separate_stems(path, work_dir)
     tracks = []
 
     if stems:
-        for name in ("bass", "other", "vocals"):
-            if name in stems:
-                tracks.append(
-                    {"id": name, "name": STEM_NAMES[name], "kind": "melodic", "notes": transcribe(stems[name])}
-                )
         drums_src = stems.get("drums", path)
+        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "notes": detect_drums(drums_src)})
+        for name in STEMS:
+            if name == "drums" or name not in stems:
+                continue
+            notes = transcribe(stems[name])
+            if len(notes) >= 8:
+                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "notes": notes})
     else:
-        tracks.append({"id": "mix", "name": "Mix completo", "kind": "melodic", "notes": transcribe(path)})
-        drums_src = path
-
-    tracks.append({"id": "drums", "name": "Bateria", "kind": "drums", "notes": detect_drums(drums_src)})
+        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "notes": detect_drums(path)})
+        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "notes": transcribe(path)})
 
     return {
         "name": path.stem,
@@ -121,5 +136,6 @@ def analyze_file(path: Path, work_dir: Path):
         "duration": duration,
         "beats": beats,
         "separated": bool(stems),
+        "separation_error": sep_error,
         "tracks": tracks,
     }

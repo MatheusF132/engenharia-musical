@@ -1,8 +1,10 @@
+import re
 import shutil
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from .analysis import analyze_file
 
@@ -18,6 +20,16 @@ app = FastAPI(title="Engenharia Musical")
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/api/audio/{job}")
+def audio(job: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", job):
+        raise HTTPException(status_code=404)
+    found = next(UPLOADS.glob(f"{job}.*"), None)
+    if not found:
+        raise HTTPException(status_code=404)
+    return FileResponse(found)
 
 
 @app.post("/api/analyze")
@@ -36,5 +48,6 @@ def analyze(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Falha na análise: {exc}") from exc
 
+    result["audio_url"] = f"/api/audio/{job}"
     result["name"] = Path(file.filename or "música").stem
     return result

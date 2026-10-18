@@ -1,17 +1,35 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { INSTRUMENTS, ORIGINAL } from "./instruments";
 import PianoRoll from "./PianoRoll";
 import { getPosition, play, stop } from "./audio";
 import type { Note, Project } from "./types";
 
 type ApiProject = Omit<Project, "tracks"> & {
-  tracks: { id: string; name: string; kind: "melodic" | "drums"; notes: Omit<Note, "id">[] }[];
+  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; notes: Omit<Note, "id">[] }[];
 };
+
+function Activity({ notes, duration, color }: { notes: Note[]; duration: number; color: string }) {
+  const bins = 48;
+  const counts = useMemo(() => {
+    const c = new Array(bins).fill(0);
+    for (const n of notes) c[Math.min(bins - 1, Math.floor((n.start / Math.max(duration, 1)) * bins))]++;
+    return c;
+  }, [notes, duration]);
+  const max = Math.max(1, ...counts);
+  return (
+    <svg className="activity" viewBox={`0 0 ${bins} 10`} preserveAspectRatio="none" aria-hidden="true">
+      {counts.map((c, i) => (
+        <rect key={i} x={i} y={10 - (c / max) * 10} width={0.8} height={(c / max) * 10} fill={color} />
+      ))}
+    </svg>
+  );
+}
 
 export default function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [trackId, setTrackId] = useState<string | null>(null);
   const [noteId, setNoteId] = useState<string | null>(null);
-  const [muted, setMuted] = useState<Set<string>>(new Set());
+  const [muted, setMuted] = useState<Set<string>>(new Set(["original"]));
   const [solo, setSolo] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
@@ -60,7 +78,7 @@ export default function App() {
       };
       setProject(p);
       setTrackId(p.tracks[0]?.id ?? null);
-      setMuted(new Set());
+      setMuted(new Set(["original"]));
       setSolo(null);
       setNoteId(null);
     } catch (e) {
@@ -86,8 +104,13 @@ export default function App() {
   async function togglePlay() {
     if (!project) return;
     if (playing) return handleStop();
-    await play(project.tracks, muted, solo);
-    setPlaying(true);
+    try {
+      await play(project.tracks, muted, solo, project.audio_url);
+      setPlaying(true);
+    } catch {
+      handleStop();
+      setError("Não consegui carregar o áudio original.");
+    }
   }
 
   const track = project?.tracks.find((t) => t.id === trackId);
@@ -101,7 +124,6 @@ export default function App() {
             <span className="chip">{project.name}</span>
             <span className="chip">{project.bpm} BPM</span>
             <span className="chip">Tom: {project.key}</span>
-            {!project.separated && <span className="chip warn">Sem separação de instrumentos</span>}
           </div>
         )}
         <label className={loading ? "btn disabled" : "btn primary"}>
@@ -122,6 +144,13 @@ export default function App() {
 
       {error && <div className="error" role="alert">{error}</div>}
 
+      {project && !project.separated && !loading && (
+        <div className="error" role="alert">
+          Os instrumentos não foram separados, então a transcrição fica bem pior.
+          Motivo: {project.separation_error}. Instale com <code>pip install -r requirements-demucs.txt</code>.
+        </div>
+      )}
+
       {loading && (
         <div className="empty" role="status">
           <p>Analisando a música… isso pode levar alguns minutos.</p>
@@ -137,30 +166,32 @@ export default function App() {
       {!loading && project && track && (
         <div className="studio">
           <aside className="tracks">
-            {project.tracks.map((t) => (
-              <div key={t.id} className={t.id === trackId ? "track active" : "track"}>
-                <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
-                  {t.name}
-                  <small>{t.notes.length} notas</small>
-                </button>
-                <button
-                  className="mini"
-                  aria-pressed={muted.has(t.id)}
-                  title="Mudo"
-                  onClick={() => toggleMute(t.id)}
-                >
-                  M
-                </button>
-                <button
-                  className="mini"
-                  aria-pressed={solo === t.id}
-                  title="Solo"
-                  onClick={() => setSolo(solo === t.id ? null : t.id)}
-                >
-                  S
-                </button>
+            {project.tracks.map((t) => {
+              const info = INSTRUMENTS[t.instrument] ?? INSTRUMENTS.other;
+              return (
+                <div key={t.id} className={t.id === trackId ? "track active" : "track"} style={{ ["--c" as string]: info.color }}>
+                  <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
+                    <span className="track-title"><span className="icon" aria-hidden="true">{info.icon}</span>{info.label}</span>
+                    <small>{info.hint} · {t.notes.length} notas</small>
+                    <Activity notes={t.notes} duration={project.duration} color={info.color} />
+                  </button>
+                  <div className="ms">
+                    <button className="mini" aria-pressed={muted.has(t.id)} aria-label={`Mudo: ${info.label}`} title="Mudo" onClick={() => toggleMute(t.id)}>M</button>
+                    <button className="mini" aria-pressed={solo === t.id} aria-label={`Solo: ${info.label}`} title="Solo" onClick={() => setSolo(solo === t.id ? null : t.id)}>S</button>
+                  </div>
+                </div>
+              );
+            })}
+            <div className="track original" style={{ ["--c" as string]: ORIGINAL.color }}>
+              <div className="track-name static">
+                <span className="track-title"><span className="icon" aria-hidden="true">{ORIGINAL.icon}</span>{ORIGINAL.label}</span>
+                <small>{ORIGINAL.hint}</small>
               </div>
-            ))}
+              <div className="ms">
+                <button className="mini" aria-pressed={muted.has("original")} aria-label="Mudo: áudio original" title="Mudo" onClick={() => toggleMute("original")}>M</button>
+                <button className="mini" aria-pressed={solo === "original"} aria-label="Solo: áudio original" title="Solo" onClick={() => setSolo(solo === "original" ? null : "original")}>S</button>
+              </div>
+            </div>
           </aside>
 
           <main className="editor">
@@ -174,7 +205,12 @@ export default function App() {
               </label>
               <span className="hint">Clique para criar nota · arraste para mover · Delete apaga</span>
             </div>
+            <div className="editor-title">
+              <span className="icon" aria-hidden="true">{(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).icon}</span>
+              {(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).label}
+            </div>
             <PianoRoll
+              color={(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).color}
               track={track}
               bpm={project.bpm}
               beats={project.beats}

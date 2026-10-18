@@ -11,6 +11,7 @@ type Props = {
   bpm: number;
   beats: number[];
   duration: number;
+  color: string;
   pps: number;
   position: number;
   selectedId: string | null;
@@ -18,7 +19,7 @@ type Props = {
   onChange: (notes: Note[]) => void;
 };
 
-export default function PianoRoll({ track, bpm, beats, duration, pps, position, selectedId, onSelect, onChange }: Props) {
+export default function PianoRoll({ track, bpm, beats, duration, color, pps, position, selectedId, onSelect, onChange }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ id: string; offset: number } | null>(null);
   const [cursor, setCursor] = useState("crosshair");
@@ -58,11 +59,11 @@ export default function PianoRoll({ track, bpm, beats, duration, pps, position, 
     for (const n of track.notes) {
       if (n.pitch < low || n.pitch > high) continue;
       ctx.globalAlpha = 0.55 + 0.45 * n.velocity;
-      ctx.fillStyle = n.id === selectedId ? "#ffd166" : "#8b6cff";
+      ctx.fillStyle = n.id === selectedId ? "#ffffff" : color;
       ctx.fillRect(n.start * pps, (high - n.pitch) * ROW + 1, Math.max(3, n.duration * pps), ROW - 2);
     }
     ctx.globalAlpha = 1;
-  }, [track.notes, selectedId, pps, beats, low, high, width, height]);
+  }, [track.notes, selectedId, pps, beats, low, high, width, height, color]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
