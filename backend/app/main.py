@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from .analysis import analyze_file
+from .analysis import STEMS, analyze_file
 
 BASE = Path(__file__).resolve().parent.parent
 UPLOADS = BASE / "uploads"
@@ -30,6 +30,16 @@ def audio(job: str):
     if not found:
         raise HTTPException(status_code=404)
     return FileResponse(found)
+
+
+@app.get("/api/stem/{job}/{name}")
+def stem(job: str, name: str):
+    if not re.fullmatch(r"[0-9a-f]{32}", job) or name not in STEMS:
+        raise HTTPException(status_code=404)
+    f = OUTPUTS / job / "htdemucs_6s" / "input" / f"{name}.wav"
+    if not f.exists():
+        raise HTTPException(status_code=404)
+    return FileResponse(f)
 
 
 @app.post("/api/analyze")

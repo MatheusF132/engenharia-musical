@@ -49,3 +49,10 @@ button:focus-visible, input:focus-visible, label:focus-within { outline: 2px sol
 .activity { width: 100%; height: 18px; margin-top: 2px; }
 .editor-title { display: flex; align-items: center; gap: 8px; padding: 10px 16px; font-weight: 600; border-bottom: 1px solid #2a2a3c; }
 .error code { background: #00000055; padding: 1px 6px; border-radius: 4px; }
+.badge { align-self: flex-start; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #1f3a2c; color: #9ff0c4; }
+.badge.edit { background: #3a2f14; color: #ffd98a; }
+.seg { display: inline-flex; border: 1px solid #3a3a55; border-radius: 8px; overflow: hidden; }
+.seg button { padding: 8px 14px; background: #1d1d2e; color: #ececf5; border: 0; cursor: pointer; font-size: 14px; }
+.seg button[aria-pressed="true"] { background: #6d4cff; color: #fff; }
+.seg button:disabled { opacity: .45; cursor: not-allowed; }
+.btn:disabled { opacity: .6; cursor: wait; }

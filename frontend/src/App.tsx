@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { INSTRUMENTS, ORIGINAL } from "./instruments";
 import PianoRoll from "./PianoRoll";
-import { getPosition, play, stop } from "./audio";
+import { clearCache, getPosition, play, stop } from "./audio";
+import type { Mode } from "./audio";
 import type { Note, Project } from "./types";
 
 type ApiProject = Omit<Project, "tracks"> & {
-  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; notes: Omit<Note, "id">[] }[];
+  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; notes: Omit<Note, "id">[] }[];
 };
 
 function Activity({ notes, duration, color }: { notes: Note[]; duration: number; color: string }) {
@@ -31,6 +32,10 @@ export default function App() {
   const [noteId, setNoteId] = useState<string | null>(null);
   const [muted, setMuted] = useState<Set<string>>(new Set(["original"]));
   const [solo, setSolo] = useState<string | null>(null);
+  const [modes, setModes] = useState<Record<string, Mode>>({});
+  const [edited, setEdited] = useState<Set<string>>(new Set());
+  const pristine = useRef<Record<string, Note[]>>({});
+  const [starting, setStarting] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [pps, setPps] = useState(80);
@@ -76,6 +81,10 @@ export default function App() {
         ...data,
         tracks: data.tracks.map((t) => ({ ...t, notes: t.notes.map((n) => ({ ...n, id: crypto.randomUUID() })) })),
       };
+      clearCache();
+      pristine.current = Object.fromEntries(p.tracks.map((t) => [t.id, t.notes]));
+      setModes(Object.fromEntries(p.tracks.map((t) => [t.id, t.audio ? "audio" : "notes"])));
+      setEdited(new Set());
       setProject(p);
       setTrackId(p.tracks[0]?.id ?? null);
       setMuted(new Set(["original"]));
@@ -89,7 +98,21 @@ export default function App() {
   }
 
   function updateNotes(notes: Note[]) {
+    if (!trackId) return;
     setProject((p) => p && { ...p, tracks: p.tracks.map((t) => (t.id === trackId ? { ...t, notes } : t)) });
+    setModes((m) => ({ ...m, [trackId]: "notes" }));
+    setEdited((e) => new Set(e).add(trackId));
+  }
+
+  function restore(id: string) {
+    setProject((p) => p && { ...p, tracks: p.tracks.map((t) => (t.id === id ? { ...t, notes: pristine.current[id] } : t)) });
+    setEdited((e) => {
+      const n = new Set(e);
+      n.delete(id);
+      return n;
+    });
+    const t = project?.tracks.find((x) => x.id === id);
+    if (t?.audio) setModes((m) => ({ ...m, [id]: "audio" }));
   }
 
   function toggleMute(id: string) {
@@ -104,12 +127,15 @@ export default function App() {
   async function togglePlay() {
     if (!project) return;
     if (playing) return handleStop();
+    setStarting(true);
     try {
-      await play(project.tracks, muted, solo, project.audio_url);
-      setPlaying(true);
+      const ok = await play(project.tracks, modes, muted, solo, project.separated ? project.audio_url : "");
+      if (ok) setPlaying(true);
     } catch {
       handleStop();
-      setError("Não consegui carregar o áudio original.");
+      setError("Não consegui carregar o áudio.");
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -146,8 +172,9 @@ export default function App() {
 
       {project && !project.separated && !loading && (
         <div className="error" role="alert">
-          Os instrumentos não foram separados, então a transcrição fica bem pior.
-          Motivo: {project.separation_error}. Instale com <code>pip install -r requirements-demucs.txt</code>.
+          Sem separação de instrumentos só dá para tocar a música inteira e a transcrição fica bem pior.
+          Motivo: {project.separation_error}. Instale o Demucs no mesmo ambiente do backend:{" "}
+          <code>pip install -r requirements-demucs.txt</code>
         </div>
       )}
 
@@ -173,6 +200,9 @@ export default function App() {
                   <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
                     <span className="track-title"><span className="icon" aria-hidden="true">{info.icon}</span>{info.label}</span>
                     <small>{info.hint} · {t.notes.length} notas</small>
+                    <span className={modes[t.id] === "audio" ? "badge" : "badge edit"}>
+                      {modes[t.id] === "audio" ? "🔊 Áudio real" : edited.has(t.id) ? "✏️ Notas editadas" : "🎹 Notas sintetizadas"}
+                    </span>
                     <Activity notes={t.notes} duration={project.duration} color={info.color} />
                   </button>
                   <div className="ms">
@@ -182,6 +212,7 @@ export default function App() {
                 </div>
               );
             })}
+            {project.separated && (
             <div className="track original" style={{ ["--c" as string]: ORIGINAL.color }}>
               <div className="track-name static">
                 <span className="track-title"><span className="icon" aria-hidden="true">{ORIGINAL.icon}</span>{ORIGINAL.label}</span>
@@ -192,18 +223,24 @@ export default function App() {
                 <button className="mini" aria-pressed={solo === "original"} aria-label="Solo: áudio original" title="Solo" onClick={() => setSolo(solo === "original" ? null : "original")}>S</button>
               </div>
             </div>
+            )}
           </aside>
 
           <main className="editor">
             <div className="toolbar">
-              <button className="btn primary" onClick={togglePlay}>
-                {playing ? "■ Parar" : "▶ Tocar"}
+              <button className="btn primary" onClick={togglePlay} disabled={starting}>
+                {starting ? "Carregando áudio…" : playing ? "■ Parar" : "▶ Tocar"}
               </button>
+              <div className="seg" role="group" aria-label="O que tocar nesta faixa">
+                <button aria-pressed={modes[track.id] === "audio"} disabled={!track.audio} onClick={() => setModes((m) => ({ ...m, [track.id]: "audio" }))}>Áudio real</button>
+                <button aria-pressed={modes[track.id] === "notes"} onClick={() => setModes((m) => ({ ...m, [track.id]: "notes" }))}>Notas</button>
+              </div>
+              {edited.has(track.id) && <button className="btn" onClick={() => restore(track.id)}>Restaurar original</button>}
               <label className="zoom">
                 Zoom
                 <input type="range" min={20} max={100} value={pps} onChange={(e) => setPps(Number(e.target.value))} />
               </label>
-              <span className="hint">Clique para criar nota · arraste para mover · Delete apaga</span>
+              <span className="hint">Editar uma nota troca a faixa para notas sintetizadas · clique cria · arraste move · Delete apaga</span>
             </div>
             <div className="editor-title">
               <span className="icon" aria-hidden="true">{(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).icon}</span>

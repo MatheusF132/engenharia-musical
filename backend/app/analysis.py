@@ -113,21 +113,22 @@ def analyze_file(path: Path, work_dir: Path):
     key = detect_key(y, sr)
     duration = round(float(len(y) / sr), 2)
 
+    job = work_dir.name
     stems, sep_error = separate_stems(path, work_dir)
     tracks = []
 
     if stems:
         drums_src = stems.get("drums", path)
-        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "notes": detect_drums(drums_src)})
+        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": f"/api/stem/{job}/drums" if "drums" in stems else None, "notes": detect_drums(drums_src)})
         for name in STEMS:
             if name == "drums" or name not in stems:
                 continue
             notes = transcribe(stems[name])
             if len(notes) >= 8:
-                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "notes": notes})
+                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "audio": f"/api/stem/{job}/{name}", "notes": notes})
     else:
-        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "notes": detect_drums(path)})
-        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "notes": transcribe(path)})
+        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": None, "notes": detect_drums(path)})
+        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "notes": transcribe(path)})
 
     return {
         "name": path.stem,
