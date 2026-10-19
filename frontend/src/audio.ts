@@ -12,6 +12,8 @@ const vols = new Map<string, Tone.Volume>();
 const cache = new Map<string, Tone.ToneAudioBuffer>();
 let token = 0;
 let pv: Tone.PolySynth | null = null;
+const banks = new Map<string, Record<string, AudioBuffer>>();
+const previewers = new Map<string, Tone.Sampler>();
 
 const WAVE: Record<string, "sine" | "triangle" | "square" | "sawtooth"> = {
   bass: "sawtooth", vocals: "sine", guitar: "square", piano: "triangle", other: "sawtooth", mix: "triangle",
@@ -32,10 +34,90 @@ export function getPosition() {
   return Tone.Transport.seconds;
 }
 
-/** Toca a nota rapidamente ao criar ou mover, como num DAW. */
-export function preview(pitch: number) {
+function sliceBuffer(buf: AudioBuffer, start: number, len: number): AudioBuffer {
+  const sr = buf.sampleRate;
+  const from = Math.max(0, Math.floor(start * sr));
+  const n = Math.max(1, Math.min(buf.length - from, Math.floor(len * sr)));
+  const out = Tone.getContext().createBuffer(buf.numberOfChannels, n, sr);
+  const fi = Math.floor(0.004 * sr);
+  const fo = Math.floor(0.04 * sr);
+  for (let c = 0; c < buf.numberOfChannels; c++) {
+    const src = buf.getChannelData(c);
+    const dst = out.getChannelData(c);
+    for (let i = 0; i < n; i++) {
+      let g = 1;
+      if (i < fi) g = i / fi;
+      else if (i > n - fo) g = (n - i) / fo;
+      dst[i] = src[from + i] * g;
+    }
+  }
+  return out;
+}
+
+/** Monta o "instrumento" a partir das próprias notas da música: uma amostra por faixa de altura. */
+function melodicBank(buf: AudioBuffer, notes: Note[]) {
+  const overlaps = (n: Note) =>
+    notes.reduce((c, m) => (m !== n && m.start < n.start + n.duration && m.start + m.duration > n.start ? c + 1 : c), 0);
+  const best = new Map<number, { n: Note; s: number }>();
+  for (const n of notes) {
+    if (n.duration < 0.12) continue;
+    const sc = n.velocity * Math.min(n.duration, 1.2) - 0.35 * overlaps(n);
+    const b = Math.floor(n.pitch / 4);
+    const cur = best.get(b);
+    if (!cur || sc > cur.s) best.set(b, { n, s: sc });
+  }
+  const urls: Record<string, AudioBuffer> = {};
+  for (const { n } of best.values()) {
+    urls[Tone.Frequency(n.pitch, "midi").toNote()] = sliceBuffer(buf, n.start - 0.005, Math.min(n.duration + 0.2, 2.5));
+  }
+  return urls;
+}
+
+/** Kit de bateria extraído da música: a melhor batida limpa de cada tipo. */
+function drumBank(buf: AudioBuffer, notes: Note[]) {
+  const urls: Record<string, AudioBuffer> = {};
+  const spec: [number, number][] = [[36, 0.4], [38, 0.3], [42, 0.15]];
+  for (const [pitch, len] of spec) {
+    let best: Note | null = null;
+    let bestScore = -Infinity;
+    for (const h of notes.filter((n) => n.pitch === pitch)) {
+      const others = notes.filter((o) => o !== h && Math.abs(o.start - h.start) < 0.08).length;
+      const sc = h.velocity - 0.4 * others;
+      if (sc > bestScore) {
+        best = h;
+        bestScore = sc;
+      }
+    }
+    if (best) urls[Tone.Frequency(pitch, "midi").toNote()] = sliceBuffer(buf, best.start - 0.005, len);
+  }
+  return urls;
+}
+
+/** Carrega o áudio do instrumento e extrai dele as amostras usadas para tocar notas novas. */
+export async function prepareTrack(t: { id: string; audio: string | null; kind: "melodic" | "drums" }, notes: Note[]) {
+  if (!t.audio || banks.has(t.id) || notes.length === 0) return;
+  const buf = (await load(t.audio)).get() as AudioBuffer | undefined;
+  if (!buf) return;
+  const urls = t.kind === "drums" ? drumBank(buf, notes) : melodicBank(buf, notes);
+  if (Object.keys(urls).length) banks.set(t.id, urls);
+}
+
+/** Toca a nota ao criar ou mover, com o som do próprio instrumento da música. */
+export function preview(trackId: string, pitch: number, drums: boolean) {
   if (Tone.getContext().state !== "running") {
     void Tone.start();
+    return;
+  }
+  const bank = banks.get(trackId);
+  if (bank) {
+    let s = previewers.get(trackId);
+    if (!s) {
+      s = new Tone.Sampler({ urls: bank, release: 0.25 }).toDestination();
+      previewers.set(trackId, s);
+    }
+    const note = Tone.Frequency(pitch, "midi").toNote();
+    if (drums) s.triggerAttack(note);
+    else s.triggerAttackRelease(note, 0.5);
     return;
   }
   if (!pv) {
@@ -58,6 +140,9 @@ export function stop() {
 
 export function clearCache() {
   stop();
+  previewers.forEach((p) => p.dispose());
+  previewers.clear();
+  banks.clear();
   cache.forEach((b) => b.dispose());
   cache.clear();
 }
@@ -133,7 +218,36 @@ function cutFilters(track: PlayTrack, startAt: number): Tone.ToneAudioNode[] {
 
   const duck: Iv[] = [];
   const byPitch = new Map<number, Iv[]>();
+  const mono = track.instrument === "vocals" || track.instrument === "bass";
+  const segs = track.segments ?? [];
   for (const r of removed) {
+    if (mono) {
+      // vale o trecho inteiro em que o instrumento soa (respiração, reverb), até a próxima nota mantida
+      const re = end(r);
+      let prevEnd = -Infinity;
+      let nextStart = Infinity;
+      for (const k of kept) {
+        if (end(k) <= r.start + 0.01) prevEnd = Math.max(prevEnd, end(k));
+        else if (k.start >= re - 0.01) nextStart = Math.min(nextStart, k.start);
+      }
+      let lo = r.start - 0.02;
+      let hi = re + 0.05;
+      if (segs.length) {
+        for (const sg of segs) {
+          if (sg[0] < re && sg[1] > r.start) {
+            lo = Math.min(lo, sg[0]);
+            hi = Math.max(hi, sg[1]);
+          }
+        }
+      } else {
+        lo = r.start - 0.15;
+        hi = re + 0.4;
+      }
+      lo = Math.max(lo, prevEnd + 0.02);
+      hi = Math.min(hi, nextStart - 0.02);
+      if (hi > lo) duck.push([lo, hi]);
+      continue;
+    }
     const overlapped = kept.some((k) => Math.min(end(k), end(r)) - Math.max(k.start, r.start) > 0.04);
     if (overlapped) {
       const list = byPitch.get(r.pitch) ?? [];
@@ -161,6 +275,19 @@ function cutFilters(track: PlayTrack, startAt: number): Tone.ToneAudioNode[] {
 
 function synthPart(track: Track, notes: Note[], vol: Tone.Volume) {
   const events = notes.map((n) => [n.start, n] as [number, Note]);
+  const bank = banks.get(track.id);
+  if (bank) {
+    const sampler = new Tone.Sampler({ urls: bank, release: 0.25 }).connect(vol);
+    nodes.push(sampler);
+    const part = new Tone.Part<any>((time: number, n: Note) => {
+      const note = Tone.Frequency(n.pitch, "midi").toNote();
+      if (track.kind === "drums") sampler.triggerAttack(note, time, n.velocity);
+      else sampler.triggerAttackRelease(note, Math.max(n.duration, 0.08), time, n.velocity);
+    }, events);
+    part.start(0);
+    parts.push(part);
+    return;
+  }
   if (track.kind === "drums") {
     const kick = new Tone.MembraneSynth().connect(vol);
     const snare = new Tone.NoiseSynth({ envelope: { attack: 0.001, decay: 0.15, sustain: 0 } }).connect(vol);
@@ -217,7 +344,12 @@ export async function play(
   const playOriginal = !!originalUrl && on("original");
   if (playOriginal) urls.add(originalUrl);
   const buffers = new Map<string, Tone.ToneAudioBuffer>();
-  await Promise.all([...urls].map(async (u) => buffers.set(u, await load(u))));
+  await Promise.all([
+    ...[...urls].map(async (u) => buffers.set(u, await load(u))),
+    ...audible
+      .filter((t) => !useAudio(t) || t.edit.added.length > 0)
+      .map((t) => prepareTrack(t, [...t.edit.kept, ...t.edit.removed])),
+  ]);
   if (my !== token) return false;
 
   for (const t of audible) {

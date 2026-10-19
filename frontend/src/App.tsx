@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import PianoRoll from "./PianoRoll";
 import { INSTRUMENTS, ORIGINAL } from "./instruments";
-import { clearCache, getPosition, play, seek, setTrackVolume, stop } from "./audio";
+import { clearCache, getPosition, play, prepareTrack, seek, setTrackVolume, stop } from "./audio";
 import type { Edit, Mode, PlayTrack } from "./audio";
 import { downloadMidi } from "./midi";
 import type { Note, Project, Track } from "./types";
 
 type ApiProject = Omit<Project, "tracks"> & {
-  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; notes: Omit<Note, "id">[] }[];
+  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; segments?: [number, number][]; notes: Omit<Note, "id">[] }[];
 };
 type Snap = { tracks: Track[]; modes: Record<string, Mode>; dirty: Set<string> };
 
@@ -34,7 +34,7 @@ function Activity({ notes, duration, color }: { notes: Note[]; duration: number;
 export default function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [trackId, setTrackId] = useState<string | null>(null);
-  const [noteId, setNoteId] = useState<string | null>(null);
+  const [noteIds, setNoteIds] = useState<string[]>([]);
   const [modes, setModes] = useState<Record<string, Mode>>({});
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [muted, setMuted] = useState<Set<string>>(new Set(["original"]));
@@ -154,7 +154,7 @@ export default function App() {
     setProject((p) => p && { ...p, tracks: s.tracks });
     setModes(s.modes);
     setDirty(s.dirty);
-    setNoteId(null);
+    setNoteIds([]);
   }
   function undo() {
     const s = undoStack.current.pop();
@@ -273,7 +273,7 @@ export default function App() {
       setSolo(null);
       setVolumes({});
       setSens({});
-      setNoteId(null);
+      setNoteIds([]);
       setProject(p);
       setTrackId(p.tracks[0]?.id ?? null);
     } catch (e) {
@@ -282,6 +282,11 @@ export default function App() {
       setLoading(false);
     }
   }
+
+  useEffect(() => {
+    if (track) void prepareTrack(track, pristine.current[track.id] ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackId, project?.audio_url]);
 
   const trackInfo = track ? info(track) : null;
   const visibleCount = track ? shown(track).length : 0;
@@ -348,7 +353,7 @@ export default function App() {
               return (
                 <div key={t.id} className={t.id === trackId ? "track active" : "track"} style={{ ["--c" as string]: ti.color }}>
                   <div className="track-body">
-                    <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
+                    <button className="track-name" onClick={() => { setTrackId(t.id); setNoteIds([]); }}>
                       <span className="track-title"><span className="icon" aria-hidden="true">{ti.icon}</span>{ti.label}</span>
                       <small>{ti.hint} · {shown(t).length} notas</small>
                       <span className={modes[t.id] === "audio" ? "badge" : "badge edit"}>
@@ -420,7 +425,7 @@ export default function App() {
               </label>
             </div>
             <div className="hint-bar">
-              Clique cria · arraste move · borda direita alonga · botão direito ou Delete remove só aquela nota do áudio · clique na régua para mover o play
+              Clique cria · arraste move · borda direita alonga · Shift+arrastar seleciona várias · botão direito ou Delete remove do áudio · clique na régua para mover o play
             </div>
             <PianoRoll
               color={trackInfo.color}
@@ -432,8 +437,8 @@ export default function App() {
               pps={pps}
               position={position}
               follow={playing}
-              selectedId={noteId}
-              onSelect={setNoteId}
+              selectedIds={noteIds}
+              onSelect={setNoteIds}
               onBegin={begin}
               onChange={updateNotes}
               onSeek={handleSeek}

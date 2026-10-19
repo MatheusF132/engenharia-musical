@@ -72,3 +72,4 @@ button:focus-visible, input:focus-visible, label:focus-within { outline: 2px sol
 .ruler-corner { position: sticky; left: 0; z-index: 4; flex: none; background: #0f0f17; border-right: 1px solid #2a2a3c; border-bottom: 1px solid #2a2a3c; }
 .ruler-wrap { position: relative; flex: none; border-bottom: 1px solid #2a2a3c; }
 .ruler-wrap canvas { display: block; }
+.marquee { position: absolute; border: 1px dashed #fff; background: #ffffff22; pointer-events: none; }

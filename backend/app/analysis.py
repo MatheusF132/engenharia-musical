@@ -116,6 +116,33 @@ def energy_gate(notes, path: Path, ratio=0.12):
     return kept
 
 
+def activity_segments(path: Path, ratio=0.06, min_gap=0.12, min_len=0.05):
+    """Trechos em que o stem realmente tem som (inclui respiração e reverb)."""
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    hop = 512
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    if rms.size == 0:
+        return []
+    active = rms >= float(np.percentile(rms, 95)) * ratio
+    segs, start = [], None
+    for i, a in enumerate(active):
+        if a and start is None:
+            start = i
+        elif not a and start is not None:
+            segs.append((start, i))
+            start = None
+    if start is not None:
+        segs.append((start, len(active)))
+    merged = []
+    for s0, e0 in segs:
+        a0, b0 = round(float(s0 * hop / sr), 3), round(float(e0 * hop / sr), 3)
+        if merged and a0 - merged[-1][1] <= min_gap:
+            merged[-1][1] = b0
+        else:
+            merged.append([a0, b0])
+    return [m for m in merged if m[1] - m[0] >= min_len]
+
+
 def transcribe(path: Path, instrument: str = "mix"):
     from basic_pitch.inference import predict
 
@@ -194,7 +221,7 @@ def analyze_file(path: Path, work_dir: Path):
                 continue
             notes = transcribe(stems[name], name)
             if len(notes) >= 8:
-                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "audio": f"/api/stem/{job}/{name}", "notes": notes})
+                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "audio": f"/api/stem/{job}/{name}", "segments": activity_segments(stems[name]), "notes": notes})
     else:
         tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": None, "notes": detect_drums(path)})
         tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "notes": transcribe(path, "mix")})

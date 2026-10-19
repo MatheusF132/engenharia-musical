@@ -1,5 +1,5 @@
 export type Note = { id: string; pitch: number; start: number; duration: number; velocity: number };
-export type Track = { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; notes: Note[] };
+export type Track = { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; segments?: [number, number][]; notes: Note[] };
 export type Project = {
   name: string;
   bpm: number;
