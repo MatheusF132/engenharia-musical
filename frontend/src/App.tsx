@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { INSTRUMENTS, ORIGINAL } from "./instruments";
 import PianoRoll from "./PianoRoll";
-import { clearCache, getPosition, play, stop } from "./audio";
-import type { Mode } from "./audio";
-import type { Note, Project } from "./types";
+import { INSTRUMENTS, ORIGINAL } from "./instruments";
+import { clearCache, getPosition, play, seek, setTrackVolume, stop } from "./audio";
+import type { Edit, Mode, PlayTrack } from "./audio";
+import { downloadMidi } from "./midi";
+import type { Note, Project, Track } from "./types";
 
 type ApiProject = Omit<Project, "tracks"> & {
   tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; notes: Omit<Note, "id">[] }[];
 };
+type Snap = { tracks: Track[]; modes: Record<string, Mode>; dirty: Set<string> };
+
+const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const info = (t: Track) => INSTRUMENTS[t.instrument] ?? INSTRUMENTS.other;
 
 function Activity({ notes, duration, color }: { notes: Note[]; duration: number; color: string }) {
   const bins = 48;
@@ -30,23 +35,85 @@ export default function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [trackId, setTrackId] = useState<string | null>(null);
   const [noteId, setNoteId] = useState<string | null>(null);
+  const [modes, setModes] = useState<Record<string, Mode>>({});
+  const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [muted, setMuted] = useState<Set<string>>(new Set(["original"]));
   const [solo, setSolo] = useState<string | null>(null);
-  const [modes, setModes] = useState<Record<string, Mode>>({});
-  const [edited, setEdited] = useState<Set<string>>(new Set());
-  const pristine = useRef<Record<string, Note[]>>({});
+  const [volumes, setVolumes] = useState<Record<string, number>>({});
+  const [sens, setSens] = useState<Record<string, number>>({});
   const [starting, setStarting] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [pps, setPps] = useState(80);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [hist, setHist] = useState({ undo: 0, redo: 0 });
+  const pristine = useRef<Record<string, Note[]>>({});
+  const undoStack = useRef<Snap[]>([]);
+  const redoStack = useRef<Snap[]>([]);
   const raf = useRef(0);
 
-  function handleStop() {
+  const minVel = (id: string) => 0.8 * (1 - (sens[id] ?? 100) / 100);
+  const shown = (t: Track) => t.notes.filter((n) => n.velocity >= minVel(t.id));
+  function editOf(t: Track): Edit {
+    const orig = pristine.current[t.id] ?? [];
+    const origIds = new Set(orig.map((n) => n.id));
+    const cur = new Map(t.notes.map((n) => [n.id, n]));
+    const removed: Note[] = [];
+    const added: Note[] = [];
+    const kept: Note[] = [];
+    for (const o of orig) {
+      const c = cur.get(o.id);
+      if (!c) removed.push(o);
+      else if (c.start !== o.start || c.pitch !== o.pitch || c.duration !== o.duration) {
+        removed.push(o);
+        added.push(c);
+      } else kept.push(o);
+    }
+    for (const c of t.notes) if (!origIds.has(c.id)) added.push(c);
+    return { removed, added, kept };
+  }
+  const playTracks = (): PlayTrack[] => (project ? project.tracks.map((t) => ({ ...t, notes: shown(t), edit: editOf(t) })) : []);
+  const track = project?.tracks.find((t) => t.id === trackId);
+
+  // ---------- reprodução ----------
+  async function startPlayback(from: number, quiet = false) {
+    if (!project) return;
+    if (!quiet) setStarting(true);
+    try {
+      const ok = await play(playTracks(), modes, muted, solo, project.separated ? project.audio_url : "", volumes, from);
+      if (ok) setPlaying(true);
+    } catch {
+      stop();
+      setPlaying(false);
+      setError("Não consegui carregar o áudio.");
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  function stopAll() {
     stop();
     setPlaying(false);
     setPosition(0);
+  }
+
+  async function togglePlay() {
+    if (!project || starting) return;
+    if (playing) {
+      const pos = getPosition();
+      stop();
+      setPlaying(false);
+      setPosition(pos);
+      return;
+    }
+    await startPlayback(position >= project.duration - 0.1 ? 0 : position);
+  }
+
+  function handleSeek(t: number) {
+    setPosition(t);
+    if (playing) void startPlayback(t, true);
+    else seek(t);
   }
 
   useEffect(() => {
@@ -55,7 +122,7 @@ export default function App() {
       const t = getPosition();
       setPosition(t);
       if (project && t > project.duration) {
-        handleStop();
+        stopAll();
         return;
       }
       raf.current = requestAnimationFrame(tick);
@@ -64,8 +131,122 @@ export default function App() {
     return () => cancelAnimationFrame(raf.current);
   }, [playing, project]);
 
+  // edições, mudo/solo e sensibilidade valem na hora, mesmo tocando
+  useEffect(() => {
+    if (!playing) return;
+    const id = window.setTimeout(() => void startPlayback(getPosition(), true), 350);
+    return () => window.clearTimeout(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.tracks, modes, muted, solo, sens]);
+
+  // ---------- histórico ----------
+  const syncHist = () => setHist({ undo: undoStack.current.length, redo: redoStack.current.length });
+  const snapshot = (): Snap => ({ tracks: project!.tracks, modes, dirty });
+
+  function begin() {
+    if (!project) return;
+    undoStack.current.push(snapshot());
+    if (undoStack.current.length > 100) undoStack.current.shift();
+    redoStack.current = [];
+    syncHist();
+  }
+  function applySnap(s: Snap) {
+    setProject((p) => p && { ...p, tracks: s.tracks });
+    setModes(s.modes);
+    setDirty(s.dirty);
+    setNoteId(null);
+  }
+  function undo() {
+    const s = undoStack.current.pop();
+    if (!s || !project) return;
+    redoStack.current.push(snapshot());
+    applySnap(s);
+    syncHist();
+  }
+  function redo() {
+    const s = redoStack.current.pop();
+    if (!s || !project) return;
+    undoStack.current.push(snapshot());
+    applySnap(s);
+    syncHist();
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement;
+      if (el.tagName === "INPUT" && (el as HTMLInputElement).type !== "range") return;
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        redo();
+      } else if (e.code === "Space" && el.tagName !== "BUTTON") {
+        e.preventDefault();
+        void togglePlay();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  // ---------- edição ----------
+  function markEdited(id: string) {
+    setModes((m) => (m[id] === "notes" ? m : { ...m, [id]: "notes" }));
+    setDirty((d) => (d.has(id) ? d : new Set(d).add(id)));
+  }
+
+  function updateNotes(visible: Note[]) {
+    if (!trackId || !project) return;
+    const t = project.tracks.find((x) => x.id === trackId);
+    if (!t) return;
+    const hidden = t.notes.filter((n) => n.velocity < minVel(t.id));
+    setProject((p) => p && { ...p, tracks: p.tracks.map((x) => (x.id === trackId ? { ...x, notes: [...hidden, ...visible] } : x)) });
+    setDirty((d) => (d.has(trackId) ? d : new Set(d).add(trackId)));
+  }
+
+  function quantize() {
+    if (!project || !track) return;
+    begin();
+    const grid = 60 / project.bpm / 4;
+    const origin = project.beats[0] ?? 0;
+    const q = (t: number) => Math.max(0, origin + Math.round((t - origin) / grid) * grid);
+    setProject((p) => p && { ...p, tracks: p.tracks.map((x) => (x.id === track.id ? { ...x, notes: x.notes.map((n) => ({ ...n, start: q(n.start) })) } : x)) });
+    markEdited(track.id);
+  }
+
+  function restore(id: string) {
+    if (!project) return;
+    begin();
+    setProject((p) => p && { ...p, tracks: p.tracks.map((x) => (x.id === id ? { ...x, notes: pristine.current[id] } : x)) });
+    setDirty((d) => {
+      const n = new Set(d);
+      n.delete(id);
+      return n;
+    });
+    const t = project.tracks.find((x) => x.id === id);
+    if (t?.audio) setModes((m) => ({ ...m, [id]: "audio" }));
+  }
+
+  function toggleMute(id: string) {
+    setMuted((m) => {
+      const next = new Set(m);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function changeVolume(id: string, v: number) {
+    setVolumes((all) => ({ ...all, [id]: v }));
+    setTrackVolume(id, v);
+  }
+
+  // ---------- upload ----------
   async function handleFile(file: File) {
-    handleStop();
+    stopAll();
     setLoading(true);
     setError(null);
     try {
@@ -83,13 +264,18 @@ export default function App() {
       };
       clearCache();
       pristine.current = Object.fromEntries(p.tracks.map((t) => [t.id, t.notes]));
+      undoStack.current = [];
+      redoStack.current = [];
+      syncHist();
       setModes(Object.fromEntries(p.tracks.map((t) => [t.id, t.audio ? "audio" : "notes"])));
-      setEdited(new Set());
-      setProject(p);
-      setTrackId(p.tracks[0]?.id ?? null);
+      setDirty(new Set());
       setMuted(new Set(["original"]));
       setSolo(null);
+      setVolumes({});
+      setSens({});
       setNoteId(null);
+      setProject(p);
+      setTrackId(p.tracks[0]?.id ?? null);
     } catch (e) {
       setError(e instanceof TypeError ? "Não consegui falar com o backend. Ele está rodando?" : (e as Error).message);
     } finally {
@@ -97,49 +283,8 @@ export default function App() {
     }
   }
 
-  function updateNotes(notes: Note[]) {
-    if (!trackId) return;
-    setProject((p) => p && { ...p, tracks: p.tracks.map((t) => (t.id === trackId ? { ...t, notes } : t)) });
-    setModes((m) => ({ ...m, [trackId]: "notes" }));
-    setEdited((e) => new Set(e).add(trackId));
-  }
-
-  function restore(id: string) {
-    setProject((p) => p && { ...p, tracks: p.tracks.map((t) => (t.id === id ? { ...t, notes: pristine.current[id] } : t)) });
-    setEdited((e) => {
-      const n = new Set(e);
-      n.delete(id);
-      return n;
-    });
-    const t = project?.tracks.find((x) => x.id === id);
-    if (t?.audio) setModes((m) => ({ ...m, [id]: "audio" }));
-  }
-
-  function toggleMute(id: string) {
-    setMuted((m) => {
-      const next = new Set(m);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  async function togglePlay() {
-    if (!project) return;
-    if (playing) return handleStop();
-    setStarting(true);
-    try {
-      const ok = await play(project.tracks, modes, muted, solo, project.separated ? project.audio_url : "");
-      if (ok) setPlaying(true);
-    } catch {
-      handleStop();
-      setError("Não consegui carregar o áudio.");
-    } finally {
-      setStarting(false);
-    }
-  }
-
-  const track = project?.tracks.find((t) => t.id === trackId);
+  const trackInfo = track ? info(track) : null;
+  const visibleCount = track ? shown(track).length : 0;
 
   return (
     <div className="app">
@@ -151,6 +296,11 @@ export default function App() {
             <span className="chip">{project.bpm} BPM</span>
             <span className="chip">Tom: {project.key}</span>
           </div>
+        )}
+        {project && (
+          <button className="btn" onClick={() => downloadMidi(project.name, project.bpm, playTracks())} title="Baixa todas as faixas como arquivo MIDI">
+            Exportar MIDI
+          </button>
         )}
         <label className={loading ? "btn disabled" : "btn primary"}>
           {project ? "Trocar música" : "Enviar música"}
@@ -190,73 +340,103 @@ export default function App() {
         </div>
       )}
 
-      {!loading && project && track && (
+      {!loading && project && track && trackInfo && (
         <div className="studio">
           <aside className="tracks">
             {project.tracks.map((t) => {
-              const info = INSTRUMENTS[t.instrument] ?? INSTRUMENTS.other;
+              const ti = info(t);
               return (
-                <div key={t.id} className={t.id === trackId ? "track active" : "track"} style={{ ["--c" as string]: info.color }}>
-                  <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
-                    <span className="track-title"><span className="icon" aria-hidden="true">{info.icon}</span>{info.label}</span>
-                    <small>{info.hint} · {t.notes.length} notas</small>
-                    <span className={modes[t.id] === "audio" ? "badge" : "badge edit"}>
-                      {modes[t.id] === "audio" ? "🔊 Áudio real" : edited.has(t.id) ? "✏️ Notas editadas" : "🎹 Notas sintetizadas"}
-                    </span>
-                    <Activity notes={t.notes} duration={project.duration} color={info.color} />
-                  </button>
+                <div key={t.id} className={t.id === trackId ? "track active" : "track"} style={{ ["--c" as string]: ti.color }}>
+                  <div className="track-body">
+                    <button className="track-name" onClick={() => { setTrackId(t.id); setNoteId(null); }}>
+                      <span className="track-title"><span className="icon" aria-hidden="true">{ti.icon}</span>{ti.label}</span>
+                      <small>{ti.hint} · {shown(t).length} notas</small>
+                      <span className={modes[t.id] === "audio" ? "badge" : "badge edit"}>
+                        {modes[t.id] === "audio" ? (dirty.has(t.id) ? "🔊 Áudio real + edições" : "🔊 Áudio real") : dirty.has(t.id) ? "✏️ Notas editadas" : "🎹 Notas sintetizadas"}
+                      </span>
+                      <Activity notes={shown(t)} duration={project.duration} color={ti.color} />
+                    </button>
+                    <label className="vol">
+                      Vol
+                      <input type="range" min={0} max={100} value={volumes[t.id] ?? 80} onChange={(e) => changeVolume(t.id, Number(e.target.value))} aria-label={`Volume: ${ti.label}`} />
+                    </label>
+                  </div>
                   <div className="ms">
-                    <button className="mini" aria-pressed={muted.has(t.id)} aria-label={`Mudo: ${info.label}`} title="Mudo" onClick={() => toggleMute(t.id)}>M</button>
-                    <button className="mini" aria-pressed={solo === t.id} aria-label={`Solo: ${info.label}`} title="Solo" onClick={() => setSolo(solo === t.id ? null : t.id)}>S</button>
+                    <button className="mini" aria-pressed={muted.has(t.id)} aria-label={`Mudo: ${ti.label}`} title="Mudo" onClick={() => toggleMute(t.id)}>M</button>
+                    <button className="mini" aria-pressed={solo === t.id} aria-label={`Solo: ${ti.label}`} title="Solo" onClick={() => setSolo(solo === t.id ? null : t.id)}>S</button>
                   </div>
                 </div>
               );
             })}
             {project.separated && (
-            <div className="track original" style={{ ["--c" as string]: ORIGINAL.color }}>
-              <div className="track-name static">
-                <span className="track-title"><span className="icon" aria-hidden="true">{ORIGINAL.icon}</span>{ORIGINAL.label}</span>
-                <small>{ORIGINAL.hint}</small>
+              <div className="track original" style={{ ["--c" as string]: ORIGINAL.color }}>
+                <div className="track-body">
+                  <div className="track-name static">
+                    <span className="track-title"><span className="icon" aria-hidden="true">{ORIGINAL.icon}</span>{ORIGINAL.label}</span>
+                    <small>{ORIGINAL.hint}</small>
+                  </div>
+                  <label className="vol">
+                    Vol
+                    <input type="range" min={0} max={100} value={volumes.original ?? 80} onChange={(e) => changeVolume("original", Number(e.target.value))} aria-label="Volume: áudio original" />
+                  </label>
+                </div>
+                <div className="ms">
+                  <button className="mini" aria-pressed={muted.has("original")} aria-label="Mudo: áudio original" title="Mudo" onClick={() => toggleMute("original")}>M</button>
+                  <button className="mini" aria-pressed={solo === "original"} aria-label="Solo: áudio original" title="Solo" onClick={() => setSolo(solo === "original" ? null : "original")}>S</button>
+                </div>
               </div>
-              <div className="ms">
-                <button className="mini" aria-pressed={muted.has("original")} aria-label="Mudo: áudio original" title="Mudo" onClick={() => toggleMute("original")}>M</button>
-                <button className="mini" aria-pressed={solo === "original"} aria-label="Solo: áudio original" title="Solo" onClick={() => setSolo(solo === "original" ? null : "original")}>S</button>
-              </div>
-            </div>
             )}
           </aside>
 
           <main className="editor">
             <div className="toolbar">
-              <button className="btn primary" onClick={togglePlay} disabled={starting}>
-                {starting ? "Carregando áudio…" : playing ? "■ Parar" : "▶ Tocar"}
+              <button className="btn primary" onClick={togglePlay} disabled={starting} title="Espaço">
+                {starting ? "Carregando áudio…" : playing ? "❚❚ Pausar" : "▶ Tocar"}
               </button>
+              <button className="btn" onClick={() => { handleSeek(0); }} title="Voltar ao início" aria-label="Voltar ao início">⏮</button>
+              <span className="time">{fmt(position)} / {fmt(project.duration)}</span>
               <div className="seg" role="group" aria-label="O que tocar nesta faixa">
                 <button aria-pressed={modes[track.id] === "audio"} disabled={!track.audio} onClick={() => setModes((m) => ({ ...m, [track.id]: "audio" }))}>Áudio real</button>
                 <button aria-pressed={modes[track.id] === "notes"} onClick={() => setModes((m) => ({ ...m, [track.id]: "notes" }))}>Notas</button>
               </div>
-              {edited.has(track.id) && <button className="btn" onClick={() => restore(track.id)}>Restaurar original</button>}
+              <button className="btn" onClick={undo} disabled={!hist.undo} title="Ctrl+Z">↶ Desfazer</button>
+              <button className="btn" onClick={redo} disabled={!hist.redo} title="Ctrl+Y">↷ Refazer</button>
+              <button className="btn" onClick={quantize} title="Alinha as notas à grade (a faixa passa a tocar as notas sintetizadas)">Quantizar</button>
+              {dirty.has(track.id) && <button className="btn" onClick={() => restore(track.id)}>Restaurar original</button>}
+            </div>
+            <div className="toolbar sub">
+              <span className="editor-title">
+                <span className="icon" aria-hidden="true">{trackInfo.icon}</span>
+                {trackInfo.label}
+              </span>
+              <label className="zoom" title="Esconde as notas mais fracas sem apagar">
+                Sensibilidade
+                <input type="range" min={0} max={100} value={sens[track.id] ?? 100} onChange={(e) => setSens((s) => ({ ...s, [track.id]: Number(e.target.value) }))} />
+                <span className="count">{visibleCount} de {track.notes.length} notas</span>
+              </label>
               <label className="zoom">
                 Zoom
                 <input type="range" min={20} max={100} value={pps} onChange={(e) => setPps(Number(e.target.value))} />
               </label>
-              <span className="hint">Editar uma nota troca a faixa para notas sintetizadas · clique cria · arraste move · Delete apaga</span>
             </div>
-            <div className="editor-title">
-              <span className="icon" aria-hidden="true">{(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).icon}</span>
-              {(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).label}
+            <div className="hint-bar">
+              Clique cria · arraste move · borda direita alonga · botão direito ou Delete remove só aquela nota do áudio · clique na régua para mover o play
             </div>
             <PianoRoll
-              color={(INSTRUMENTS[track.instrument] ?? INSTRUMENTS.other).color}
-              track={track}
+              color={trackInfo.color}
+              track={{ ...track, notes: shown(track) }}
+              allNotes={track.notes}
               bpm={project.bpm}
               beats={project.beats}
               duration={project.duration}
               pps={pps}
               position={position}
+              follow={playing}
               selectedId={noteId}
               onSelect={setNoteId}
+              onBegin={begin}
               onChange={updateNotes}
+              onSeek={handleSeek}
             />
           </main>
         </div>

@@ -56,3 +56,19 @@ button:focus-visible, input:focus-visible, label:focus-within { outline: 2px sol
 .seg button[aria-pressed="true"] { background: #6d4cff; color: #fff; }
 .seg button:disabled { opacity: .45; cursor: not-allowed; }
 .btn:disabled { opacity: .6; cursor: wait; }
+.toolbar { flex-wrap: wrap; }
+.toolbar.sub { padding-top: 6px; padding-bottom: 6px; }
+.editor { min-height: 0; }
+.editor-title { border: 0; padding: 0; }
+.time { font-variant-numeric: tabular-nums; color: #c8c8e0; font-size: 14px; min-width: 84px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.count { color: #a0a0bd; font-size: 12px; min-width: 110px; }
+.hint-bar { padding: 6px 16px; font-size: 12px; color: #a0a0bd; border-bottom: 1px solid #2a2a3c; }
+.track-body { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.track-body .track-name { flex: none; }
+.vol { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #a0a0bd; padding: 0 4px; }
+.vol input { flex: 1; cursor: pointer; }
+.ruler-row { display: flex; position: sticky; top: 0; z-index: 3; width: max-content; min-width: 100%; background: #13131c; }
+.ruler-corner { position: sticky; left: 0; z-index: 4; flex: none; background: #0f0f17; border-right: 1px solid #2a2a3c; border-bottom: 1px solid #2a2a3c; }
+.ruler-wrap { position: relative; flex: none; border-bottom: 1px solid #2a2a3c; }
+.ruler-wrap canvas { display: block; }

@@ -60,10 +60,74 @@ def separate_stems(path: Path, out_dir: Path):
     return stems, (None if stems else "O Demucs não gerou arquivos")
 
 
-def transcribe(path: Path):
+PARAMS = {
+    "bass":   dict(minf=30.0, maxf=350.0, onset=0.6, frame=0.4, minlen=90.0, minvel=0.25, mono=True),
+    "vocals": dict(minf=80.0, maxf=1100.0, onset=0.65, frame=0.45, minlen=110.0, minvel=0.3, mono=True),
+    "guitar": dict(minf=80.0, maxf=1400.0, onset=0.6, frame=0.4, minlen=90.0, minvel=0.25, mono=False),
+    "piano":  dict(minf=50.0, maxf=2100.0, onset=0.6, frame=0.4, minlen=90.0, minvel=0.25, mono=False),
+    "other":  dict(minf=60.0, maxf=2100.0, onset=0.65, frame=0.45, minlen=100.0, minvel=0.3, mono=False),
+    "mix":    dict(minf=50.0, maxf=2000.0, onset=0.65, frame=0.45, minlen=100.0, minvel=0.3, mono=False),
+}
+
+
+def merge_same_pitch(notes, gap=0.06):
+    out, last = [], {}
+    for n in sorted(notes, key=lambda n: n["start"]):
+        prev = last.get(n["pitch"])
+        if prev and n["start"] - (prev["start"] + prev["duration"]) <= gap:
+            end = max(prev["start"] + prev["duration"], n["start"] + n["duration"])
+            prev["duration"] = round(end - prev["start"], 3)
+            prev["velocity"] = max(prev["velocity"], n["velocity"])
+        else:
+            out.append(n)
+            last[n["pitch"]] = n
+    return out
+
+
+def make_mono(notes):
+    """Instrumentos de uma nota só por vez (baixo, voz): mantém a mais forte."""
+    out = []
+    for n in sorted(notes, key=lambda n: n["start"]):
+        if out and n["start"] < out[-1]["start"] + out[-1]["duration"]:
+            prev = out[-1]
+            if n["velocity"] >= prev["velocity"]:
+                prev["duration"] = round(max(0.0, n["start"] - prev["start"]), 3)
+                if prev["duration"] < 0.05:
+                    out.pop()
+                out.append(n)
+        else:
+            out.append(n)
+    return out
+
+
+def energy_gate(notes, path: Path, ratio=0.12):
+    """Remove notas em trechos quase silenciosos do stem (vazamento de outros instrumentos)."""
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    if rms.size == 0:
+        return notes
+    limit = float(np.percentile(rms, 95)) * ratio
+    kept = []
+    for n in notes:
+        i = min(rms.size - 1, int(n["start"] * sr / 512))
+        j = min(rms.size, i + max(1, int(n["duration"] * sr / 512)))
+        if float(rms[i:j].mean()) >= limit:
+            kept.append(n)
+    return kept
+
+
+def transcribe(path: Path, instrument: str = "mix"):
     from basic_pitch.inference import predict
 
-    _, _, events = predict(str(path))
+    p = PARAMS.get(instrument, PARAMS["mix"])
+    _, _, events = predict(
+        str(path),
+        onset_threshold=p["onset"],
+        frame_threshold=p["frame"],
+        minimum_note_length=p["minlen"],
+        minimum_frequency=p["minf"],
+        maximum_frequency=p["maxf"],
+    )
     notes = [
         {
             "pitch": int(pitch),
@@ -73,6 +137,11 @@ def transcribe(path: Path):
         }
         for start, end, pitch, amp, _ in events
     ]
+    notes = [n for n in notes if n["duration"] >= 0.06 and n["velocity"] >= p["minvel"]]
+    notes = merge_same_pitch(notes)
+    if p["mono"]:
+        notes = make_mono(notes)
+    notes = energy_gate(notes, path)
     return sorted(notes, key=lambda n: n["start"])
 
 
@@ -123,12 +192,12 @@ def analyze_file(path: Path, work_dir: Path):
         for name in STEMS:
             if name == "drums" or name not in stems:
                 continue
-            notes = transcribe(stems[name])
+            notes = transcribe(stems[name], name)
             if len(notes) >= 8:
                 tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "audio": f"/api/stem/{job}/{name}", "notes": notes})
     else:
         tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": None, "notes": detect_drums(path)})
-        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "notes": transcribe(path)})
+        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "notes": transcribe(path, "mix")})
 
     return {
         "name": path.stem,
