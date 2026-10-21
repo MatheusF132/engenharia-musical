@@ -1,14 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import PianoRoll from "./PianoRoll";
-import { INSTRUMENTS, ORIGINAL } from "./instruments";
-import { clearCache, getPosition, play, prepareTrack, seek, setTrackVolume, stop } from "./audio";
+import { INSTRUMENTS, ORIGINAL, TYPE_OPTIONS } from "./instruments";
+import { clearCache, getPeaks, getPosition, play, prepareTrack, seek, setTrackVolume, stop } from "./audio";
 import type { Edit, Mode, PlayTrack } from "./audio";
 import { downloadMidi } from "./midi";
 import type { Note, Project, Track } from "./types";
 
-type ApiProject = Omit<Project, "tracks"> & {
-  tracks: { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; segments?: [number, number][]; notes: Omit<Note, "id">[] }[];
-};
+type ApiProject = Omit<Project, "tracks"> & { tracks: (Omit<Track, "notes"> & { notes: Omit<Note, "id">[] })[] };
 type Snap = { tracks: Track[]; modes: Record<string, Mode>; dirty: Set<string> };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
@@ -41,6 +39,7 @@ export default function App() {
   const [solo, setSolo] = useState<string | null>(null);
   const [volumes, setVolumes] = useState<Record<string, number>>({});
   const [sens, setSens] = useState<Record<string, number>>({});
+  const [peaks, setPeaks] = useState<Float32Array | null>(null);
   const [starting, setStarting] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
@@ -54,7 +53,7 @@ export default function App() {
   const raf = useRef(0);
 
   const minVel = (id: string) => 0.8 * (1 - (sens[id] ?? 100) / 100);
-  const shown = (t: Track) => t.notes.filter((n) => n.velocity >= minVel(t.id));
+  const shown = (t: Track) => (t.kind === "clips" ? t.notes : t.notes.filter((n) => n.velocity >= minVel(t.id)));
   function editOf(t: Track): Edit {
     const orig = pristine.current[t.id] ?? [];
     const origIds = new Set(orig.map((n) => n.id));
@@ -62,6 +61,23 @@ export default function App() {
     const removed: Note[] = [];
     const added: Note[] = [];
     const kept: Note[] = [];
+    if (t.kind === "clips") {
+      for (const o of orig) {
+        const c = cur.get(o.id);
+        if (!c) removed.push(o);
+        else if (c.start !== o.start || (c.src ?? c.start) !== (o.src ?? o.start)) {
+          removed.push(o);
+          added.push(c);
+        } else {
+          const cEnd = c.start + c.duration;
+          const oEnd = o.start + o.duration;
+          if (cEnd < oEnd - 0.001) removed.push({ ...o, start: cEnd, duration: oEnd - cEnd });
+          kept.push(c);
+        }
+      }
+      for (const c of t.notes) if (!origIds.has(c.id)) added.push(c);
+      return { removed, added, kept };
+    }
     for (const o of orig) {
       const c = cur.get(o.id);
       if (!c) removed.push(o);
@@ -77,7 +93,7 @@ export default function App() {
   const track = project?.tracks.find((t) => t.id === trackId);
 
   // ---------- reprodução ----------
-  async function startPlayback(from: number, quiet = false) {
+  async function startPlayback(from: number | null, quiet = false) {
     if (!project) return;
     if (!quiet) setStarting(true);
     try {
@@ -134,7 +150,7 @@ export default function App() {
   // edições, mudo/solo e sensibilidade valem na hora, mesmo tocando
   useEffect(() => {
     if (!playing) return;
-    const id = window.setTimeout(() => void startPlayback(getPosition(), true), 350);
+    const id = window.setTimeout(() => void startPlayback(null, true), 350);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.tracks, modes, muted, solo, sens]);
@@ -288,6 +304,21 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trackId, project?.audio_url]);
 
+  useEffect(() => {
+    setPeaks(null);
+    if (!track?.audio) return;
+    let alive = true;
+    getPeaks(track.audio).then((p) => alive && setPeaks(p)).catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackId, project?.audio_url]);
+
+  function changeType(id: string, instrument: string) {
+    setProject((p) => p && { ...p, tracks: p.tracks.map((x) => (x.id === id ? { ...x, instrument } : x)) });
+  }
+
   const trackInfo = track ? info(track) : null;
   const visibleCount = track ? shown(track).length : 0;
 
@@ -355,7 +386,7 @@ export default function App() {
                   <div className="track-body">
                     <button className="track-name" onClick={() => { setTrackId(t.id); setNoteIds([]); }}>
                       <span className="track-title"><span className="icon" aria-hidden="true">{ti.icon}</span>{ti.label}</span>
-                      <small>{ti.hint} · {shown(t).length} notas</small>
+                      <small>{ti.hint} · {shown(t).length} {t.kind === "clips" ? "frases" : "notas"}</small>
                       <span className={modes[t.id] === "audio" ? "badge" : "badge edit"}>
                         {modes[t.id] === "audio" ? (dirty.has(t.id) ? "🔊 Áudio real + edições" : "🔊 Áudio real") : dirty.has(t.id) ? "✏️ Notas editadas" : "🎹 Notas sintetizadas"}
                       </span>
@@ -402,11 +433,11 @@ export default function App() {
               <span className="time">{fmt(position)} / {fmt(project.duration)}</span>
               <div className="seg" role="group" aria-label="O que tocar nesta faixa">
                 <button aria-pressed={modes[track.id] === "audio"} disabled={!track.audio} onClick={() => setModes((m) => ({ ...m, [track.id]: "audio" }))}>Áudio real</button>
-                <button aria-pressed={modes[track.id] === "notes"} onClick={() => setModes((m) => ({ ...m, [track.id]: "notes" }))}>Notas</button>
+                {track.kind !== "clips" && <button aria-pressed={modes[track.id] === "notes"} onClick={() => setModes((m) => ({ ...m, [track.id]: "notes" }))}>Notas</button>}
               </div>
               <button className="btn" onClick={undo} disabled={!hist.undo} title="Ctrl+Z">↶ Desfazer</button>
               <button className="btn" onClick={redo} disabled={!hist.redo} title="Ctrl+Y">↷ Refazer</button>
-              <button className="btn" onClick={quantize} title="Alinha as notas à grade (a faixa passa a tocar as notas sintetizadas)">Quantizar</button>
+              {track.kind === "melodic" && <button className="btn" onClick={quantize} title="Alinha as notas à grade (a faixa passa a tocar as notas sintetizadas)">Quantizar</button>}
               {dirty.has(track.id) && <button className="btn" onClick={() => restore(track.id)}>Restaurar original</button>}
             </div>
             <div className="toolbar sub">
@@ -414,23 +445,38 @@ export default function App() {
                 <span className="icon" aria-hidden="true">{trackInfo.icon}</span>
                 {trackInfo.label}
               </span>
+              {track.kind === "melodic" && (
+                <label className="zoom" title="Estimado pela análise: troque se o nome estiver errado">
+                  Tipo
+                  <select value={track.instrument} onChange={(e) => changeType(track.id, e.target.value)} className="type-select">
+                    {[...new Set([track.instrument, ...TYPE_OPTIONS])].map((k) => (
+                      <option key={k} value={k}>{INSTRUMENTS[k]?.label ?? k}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {track.kind !== "clips" && (
               <label className="zoom" title="Esconde as notas mais fracas sem apagar">
                 Sensibilidade
                 <input type="range" min={0} max={100} value={sens[track.id] ?? 100} onChange={(e) => setSens((s) => ({ ...s, [track.id]: Number(e.target.value) }))} />
                 <span className="count">{visibleCount} de {track.notes.length} notas</span>
               </label>
+              )}
               <label className="zoom">
                 Zoom
                 <input type="range" min={20} max={100} value={pps} onChange={(e) => setPps(Number(e.target.value))} />
               </label>
             </div>
             <div className="hint-bar">
-              Clique cria · arraste move · borda direita alonga · Shift+arrastar seleciona várias · botão direito ou Delete remove do áudio · clique na régua para mover o play
+              {track.kind === "clips"
+                ? "Cada bloco é uma frase · arraste move · puxe as bordas para cortar · Ctrl+D duplica · botão direito ou Delete remove a frase do áudio"
+                : "Clique cria · arraste move · puxe a borda direita para alongar · Shift+arrastar seleciona várias · Ctrl+D duplica · botão direito ou Delete remove do áudio"}
             </div>
             <PianoRoll
               color={trackInfo.color}
               track={{ ...track, notes: shown(track) }}
               allNotes={track.notes}
+              peaks={peaks}
               bpm={project.bpm}
               beats={project.beats}
               duration={project.duration}

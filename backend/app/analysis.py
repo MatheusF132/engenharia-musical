@@ -5,13 +5,13 @@ from pathlib import Path
 import librosa
 import numpy as np
 import soundfile as sf
+from scipy.signal import butter, sosfiltfilt
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 DRUM_PITCH = {"kick": 36, "snare": 38, "hihat": 42}
 STEMS = ("drums", "bass", "vocals", "guitar", "piano", "other")
-LABELS = {"bass": "Baixo", "vocals": "Voz", "guitar": "Guitarra / violão", "piano": "Piano / teclas", "other": "Outros", "drums": "Bateria", "mix": "Mix completo"}
 
 
 def detect_bpm(y, sr):
@@ -143,12 +143,173 @@ def activity_segments(path: Path, ratio=0.06, min_gap=0.12, min_len=0.05):
     return [m for m in merged if m[1] - m[0] >= min_len]
 
 
-def transcribe(path: Path, instrument: str = "mix"):
+# ---------- grade rítmica ----------
+
+def beat_grid(beats, sub):
+    """Subdivisões (sub por tempo) interpoladas entre as batidas detectadas, acompanhando a deriva do andamento."""
+    b = np.array(beats, dtype=float)
+    if len(b) < 2:
+        return np.array([])
+    step = float(np.median(np.diff(b)))
+    ext = np.concatenate([[b[0] - step * k for k in range(8, 0, -1)], b, [b[-1] + step * k for k in range(1, 9)]])
+    grid = []
+    for i in range(len(ext) - 1):
+        for k in range(sub):
+            grid.append(ext[i] + (ext[i + 1] - ext[i]) * k / sub)
+    grid.append(ext[-1])
+    g = np.array(grid)
+    return g[g >= 0]
+
+
+def snap_time(t, grid, tol=0.45):
+    if grid.size == 0:
+        return t
+    i = int(np.searchsorted(grid, t))
+    lo = grid[max(i - 1, 0)]
+    hi = grid[min(i, len(grid) - 1)]
+    cand = lo if abs(t - lo) <= abs(hi - t) else hi
+    spacing = float(hi - lo) if hi > lo else 0.1
+    return float(cand) if abs(cand - t) <= tol * spacing else float(t)
+
+
+def quantize_notes(notes, grid):
+    """Música eletrônica é programada na grade: alinha início e fim das notas a 1/16."""
+    if grid.size < 2:
+        return notes
+    step = float(np.median(np.diff(grid)))
+    out = []
+    for n in notes:
+        s = snap_time(n["start"], grid)
+        e = snap_time(n["start"] + n["duration"], grid)
+        if e - s < step * 0.9:
+            e = s + step
+        out.append({**n, "start": round(s, 3), "duration": round(e - s, 3)})
+    return out
+
+
+# ---------- bateria ----------
+
+DRUM_BANDS = {
+    "kick": dict(pitch=36, lo=30.0, hi=160.0, delta=0.10, wait=0.07, dur=0.2, sub=4),
+    "snare": dict(pitch=38, lo=900.0, hi=4500.0, delta=0.12, wait=0.08, dur=0.15, sub=4),
+    "hat": dict(pitch=42, lo=6500.0, hi=10500.0, delta=0.10, wait=0.035, dur=0.06, sub=8),
+}
+
+
+def _refine(yb, sr, t0):
+    a = int(max(0, (t0 - 0.015) * sr))
+    b = int(min(len(yb), (t0 + 0.07) * sr))
+    seg = np.abs(yb[a:b])
+    if seg.size == 0:
+        return t0
+    k = max(1, int(0.0015 * sr))
+    env = np.convolve(seg, np.ones(k) / k, mode="same")
+    peak = float(env.max())
+    if peak <= 0:
+        return t0
+    return (a + int(np.argmax(env > 0.35 * peak))) / sr
+
+
+def _band_onsets(y, sr, p):
+    sos = butter(4, [p["lo"], min(p["hi"], sr / 2 - 100)], btype="band", fs=sr, output="sos")
+    yb = sosfiltfilt(sos, y)
+    hop = 128
+    env = librosa.onset.onset_strength(y=yb, sr=sr, hop_length=hop, n_fft=1024)
+    env = env / (float(np.percentile(env, 99)) + 1e-9)
+    frames = librosa.util.peak_pick(
+        env,
+        pre_max=int(0.03 * sr / hop),
+        post_max=int(0.03 * sr / hop),
+        pre_avg=int(0.1 * sr / hop),
+        post_avg=int(0.1 * sr / hop),
+        delta=p["delta"],
+        wait=int(p["wait"] * sr / hop),
+    )
+    hits = []
+    for f in frames:
+        if min(1.0, float(env[f])) < 0.25:
+            continue
+        t = _refine(yb, sr, float(f * hop / sr))
+        a0, b0 = int(t * sr), int((t + 0.06) * sr)
+        amp = float(np.sqrt(np.mean(yb[a0:b0] ** 2))) if b0 > a0 else 0.0
+        hits.append((t, amp))
+    if not hits:
+        return []
+    ref = float(np.percentile([h[1] for h in hits], 75)) + 1e-12
+    # força relativa à batida típica da faixa; vazamento de outras peças fica fraco e cai fora
+    out = [(t, min(1.0, amp / ref)) for t, amp in hits]
+    return [(t, s0) for t, s0 in out if s0 >= 0.35]
+
+
+def detect_drums(path: Path, beats):
+    """Kick, snare e hi-hat por faixa de frequência, alinhados à grade. Devolve (notas, deslocamento da grade)."""
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    raw = {k: _band_onsets(y, sr, p) for k, p in DRUM_BANDS.items()}
+
+    # a grade do beat tracking pode estar atrasada/adiantada: acerta pela posição real dos kicks e snares
+    grid4 = beat_grid(beats, 4)
+    shift = 0.0
+    if grid4.size:
+        res = []
+        for k in ("kick", "snare"):
+            for t, _ in raw[k]:
+                i = int(np.searchsorted(grid4, t))
+                lo, hi = grid4[max(i - 1, 0)], grid4[min(i, len(grid4) - 1)]
+                near = lo if abs(t - lo) <= abs(hi - t) else hi
+                spacing = float(hi - lo) if hi > lo else 0.1
+                if abs(t - near) < 0.25 * spacing:
+                    res.append(t - near)
+        if len(res) >= 8:
+            shift = float(np.median(res))
+
+    shifted = [max(0.0, b + shift) for b in beats]
+    notes = []
+    for k, p in DRUM_BANDS.items():
+        grid = beat_grid(shifted, p["sub"])
+        seen = set()
+        for t, strength in raw[k]:
+            ts = round(snap_time(t, grid), 3)
+            if ts in seen:
+                continue
+            seen.add(ts)
+            notes.append({"pitch": p["pitch"], "start": ts, "duration": p["dur"], "velocity": round(strength, 2)})
+    return sorted(notes, key=lambda n: n["start"]), shift
+
+
+# ---------- vocal: uma faixa por frase ----------
+
+def vocal_phrases(path: Path):
+    segs = activity_segments(path, ratio=0.1, min_gap=0.4, min_len=0.3)
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    ref = float(np.percentile(rms, 95)) + 1e-9
+    clips = []
+    for a, b in segs:
+        i = int(a * sr / 512)
+        j = max(i + 1, int(b * sr / 512))
+        v = float(rms[i:j].mean() / ref)
+        clips.append({"pitch": 60, "start": a, "duration": round(b - a, 3), "velocity": round(min(1.0, max(0.3, v)), 2), "src": a})
+    return clips
+
+
+# ---------- instrumentos melódicos ----------
+
+def harmonic_copy(path: Path) -> Path:
+    """Tira transientes (bateria que vaza no stem) antes de transcrever."""
+    y, sr = librosa.load(str(path), sr=22050, mono=True)
+    yh = librosa.effects.harmonic(y, margin=3.0)
+    out = path.with_name(path.stem + "_harm.wav")
+    sf.write(str(out), yh, sr)
+    return out
+
+
+def transcribe(path: Path, instrument: str = "mix", grid=None):
     from basic_pitch.inference import predict
 
     p = PARAMS.get(instrument, PARAMS["mix"])
+    src = path if instrument == "bass" else harmonic_copy(path)
     _, _, events = predict(
-        str(path),
+        str(src),
         onset_threshold=p["onset"],
         frame_threshold=p["frame"],
         minimum_note_length=p["minlen"],
@@ -169,62 +330,92 @@ def transcribe(path: Path, instrument: str = "mix"):
     if p["mono"]:
         notes = make_mono(notes)
     notes = energy_gate(notes, path)
+    if grid is not None:
+        notes = merge_same_pitch(quantize_notes(notes, grid), gap=0.0)
+        if p["mono"]:
+            notes = make_mono(notes)
     return sorted(notes, key=lambda n: n["start"])
 
 
-def detect_drums(path: Path):
-    y, sr = librosa.load(str(path), sr=22050, mono=True)
-    hop = 512
-    frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop, units="frames")
-    spec = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    low = spec[freqs < 150].sum(axis=0)
-    mid = spec[(freqs >= 150) & (freqs < 2500)].sum(axis=0)
-    high = spec[freqs >= 5000].sum(axis=0)
-
-    notes = []
-    for f in frames:
-        l, m, h = low[f : f + 3].sum(), mid[f : f + 3].sum(), high[f : f + 3].sum()
-        total = l + m + h + 1e-9
-        if l / total > 0.5:
-            kind = "kick"
-        elif h / total > 0.35:
-            kind = "hihat"
+def classify_instrument(stem: str, notes) -> str:
+    """Nome no estilo do FL Studio, estimado pelo comportamento das notas (o usuário pode trocar)."""
+    if not notes:
+        return "other"
+    pitches = np.array([n["pitch"] for n in notes])
+    durs = np.array([n["duration"] for n in notes])
+    med_p, med_d = float(np.median(pitches)), float(np.median(durs))
+    if stem == "bass":
+        return "bass808" if med_p <= 40 and med_d >= 0.3 else "bass"
+    spans = sorted((n["start"], n["start"] + n["duration"]) for n in notes)
+    active, cur_s, cur_e = 0.0, spans[0][0], spans[0][1]
+    for s0, e0 in spans[1:]:
+        if s0 <= cur_e:
+            cur_e = max(cur_e, e0)
         else:
-            kind = "snare"
-        notes.append(
-            {
-                "pitch": DRUM_PITCH[kind],
-                "start": round(float(librosa.frames_to_time(f, sr=sr, hop_length=hop)), 3),
-                "duration": 0.1,
-                "velocity": 0.8,
-            }
-        )
-    return notes
+            active += cur_e - cur_s
+            cur_s, cur_e = s0, e0
+    active += cur_e - cur_s
+    poly = float(durs.sum()) / max(active, 1e-6)
+    if med_p >= 78 and poly < 2:
+        return "bell"
+    if poly >= 2.6 and med_d >= 0.6:
+        return "strings" if stem == "other" and med_p < 60 else "pad"
+    if poly >= 1.8 and med_d < 0.6:
+        return "piano" if stem == "piano" else "keys"
+    if poly >= 1.8 and stem == "guitar" and med_d >= 0.35:
+        return "guitar"
+    if med_d < 0.22:
+        return "pluck"
+    if stem == "piano":
+        return "piano"
+    return "lead"
 
 
 def analyze_file(path: Path, work_dir: Path):
+    job = work_dir.name
     y, sr = librosa.load(str(path), sr=22050, mono=True)
     bpm, beats = detect_bpm(y, sr)
     key = detect_key(y, sr)
     duration = round(float(len(y) / sr), 2)
 
-    job = work_dir.name
     stems, sep_error = separate_stems(path, work_dir)
-    tracks = []
+    drums_src = stems.get("drums", path)
+    drum_notes, shift = detect_drums(drums_src, beats)
+    beats = [round(max(0.0, b + shift), 3) for b in beats]
+    grid16 = beat_grid(beats, 4)
+
+    def stem_url(name):
+        return f"/api/stem/{job}/{name}" if name in stems else None
+
+    tracks = [
+        {"id": "drums", "name": "Bateria", "instrument": "drums", "kind": "drums", "audio": stem_url("drums"), "segments": [], "notes": drum_notes}
+    ]
 
     if stems:
-        drums_src = stems.get("drums", path)
-        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": f"/api/stem/{job}/drums" if "drums" in stems else None, "notes": detect_drums(drums_src)})
-        for name in STEMS:
-            if name == "drums" or name not in stems:
+        if "vocals" in stems:
+            phrases = vocal_phrases(stems["vocals"])
+            if phrases:
+                tracks.append({"id": "vocals", "name": "Vocal", "instrument": "vocals", "kind": "clips", "audio": stem_url("vocals"), "segments": [], "notes": phrases})
+        for name in ("bass", "guitar", "piano", "other"):
+            if name not in stems:
                 continue
-            notes = transcribe(stems[name], name)
+            notes = transcribe(stems[name], name, grid16)
             if len(notes) >= 8:
-                tracks.append({"id": name, "name": LABELS[name], "instrument": name, "kind": "melodic", "audio": f"/api/stem/{job}/{name}", "segments": activity_segments(stems[name]), "notes": notes})
+                tracks.append(
+                    {
+                        "id": name,
+                        "name": name,
+                        "instrument": classify_instrument(name, notes),
+                        "kind": "melodic",
+                        "audio": stem_url(name),
+                        "segments": activity_segments(stems[name]) if name == "bass" else [],
+                        "notes": notes,
+                    }
+                )
     else:
-        tracks.append({"id": "drums", "name": LABELS["drums"], "instrument": "drums", "kind": "drums", "audio": None, "notes": detect_drums(path)})
-        tracks.append({"id": "mix", "name": LABELS["mix"], "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "notes": transcribe(path, "mix")})
+        tracks.append(
+            {"id": "mix", "name": "Mix completo", "instrument": "mix", "kind": "melodic", "audio": f"/api/audio/{job}", "segments": [], "notes": transcribe(path, "mix", grid16)}
+        )
 
     return {
         "name": path.stem,

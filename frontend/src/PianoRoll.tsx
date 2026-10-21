@@ -4,14 +4,17 @@ import type { Note, Track } from "./types";
 
 const KEY_W = 64;
 const RULER_H = 24;
+const WAVE_H = 44;
 const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const BLACK = new Set([1, 3, 6, 8, 10]);
 const DRUM_LANES = [42, 38, 36];
 const DRUM_LABELS: Record<number, string> = { 42: "Hi-hat", 38: "Snare", 36: "Kick" };
+const DRUM_DUR: Record<number, number> = { 42: 0.06, 38: 0.15, 36: 0.2 };
 
 type Props = {
   track: Track;
   allNotes: Note[];
+  peaks: Float32Array | null;
   bpm: number;
   beats: number[];
   duration: number;
@@ -27,20 +30,31 @@ type Props = {
 };
 
 type Group = { id: string; start: number; row: number };
-type Drag = { type: "move" | "resize"; anchor: string; offset: number; startRow: number; group: Group[]; began: boolean; lastPitch: number };
+type DragType = "move" | "right" | "left";
+type Drag = { type: DragType; anchor: string; init: Note; offset: number; startRow: number; group: Group[]; began: boolean; lastPitch: number };
 type Rect = { x0: number; y0: number; x1: number; y1: number };
 
+function peakAt(pk: Float32Array, t: number, span: number) {
+  const i0 = Math.max(0, Math.floor(t * 100));
+  const i1 = Math.max(i0 + 1, Math.floor((t + span) * 100));
+  let m = 0;
+  for (let i = i0; i < i1 && i < pk.length; i++) if (pk[i] > m) m = pk[i];
+  return Math.sqrt(m);
+}
+
 export default function PianoRoll({
-  track, allNotes, bpm, beats, duration, color, pps, position, follow, selectedIds, onSelect, onBegin, onChange, onSeek,
+  track, allNotes, peaks, bpm, beats, duration, color, pps, position, follow, selectedIds, onSelect, onBegin, onChange, onSeek,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rulerRef = useRef<HTMLCanvasElement>(null);
+  const waveRef = useRef<HTMLCanvasElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
   const marqRef = useRef<Rect | null>(null);
   const [marq, setMarq] = useState<Rect | null>(null);
   const [cursor, setCursor] = useState("crosshair");
   const drums = track.kind === "drums";
+  const clips = track.kind === "clips";
   const selSet = useMemo(() => new Set(selectedIds), [selectedIds]);
 
   const { low, high } = useMemo(() => {
@@ -51,18 +65,20 @@ export default function PianoRoll({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [track.id]);
 
-  const rowH = drums ? 44 : 16;
-  const rows = drums ? DRUM_LANES.length : high - low + 1;
+  const rowH = drums ? 44 : clips ? 88 : 16;
+  const rows = drums ? DRUM_LANES.length : clips ? 1 : high - low + 1;
   const clampRow = (r: number) => Math.min(rows - 1, Math.max(0, r));
-  const pitchToRow = (p: number) => (drums ? DRUM_LANES.indexOf(p) : high - p);
-  const rowToPitch = (r: number) => (drums ? DRUM_LANES[clampRow(r)] : high - clampRow(r));
+  const pitchToRow = (p: number) => (drums ? DRUM_LANES.indexOf(p) : clips ? 0 : high - p);
+  const rowToPitch = (r: number) => (drums ? DRUM_LANES[clampRow(r)] : clips ? 60 : high - clampRow(r));
 
   const width = Math.ceil(duration * pps);
   const height = rows * rowH;
   const grid = 60 / bpm / 4;
   const origin = beats[0] ?? 0;
-  const snap = (t: number) => origin + Math.round((t - origin) / grid) * grid;
+  const snapT = (t: number) => (clips ? Math.round(t * 100) / 100 : origin + Math.round((t - origin) / grid) * grid);
+  const minDur = clips ? 0.1 : drums ? 0.03 : grid;
 
+  // ----- grade de notas / frases -----
   useEffect(() => {
     const c = canvasRef.current;
     if (!c) return;
@@ -70,7 +86,7 @@ export default function PianoRoll({
     ctx.clearRect(0, 0, c.width, c.height);
     for (let i = 0; i < rows; i++) {
       const y = i * rowH;
-      ctx.fillStyle = drums ? (i % 2 ? "#1d1d2b" : "#181824") : BLACK.has(rowToPitch(i) % 12) ? "#161622" : "#1d1d2b";
+      ctx.fillStyle = drums || clips ? (i % 2 ? "#1d1d2b" : "#181824") : BLACK.has(rowToPitch(i) % 12) ? "#161622" : "#1d1d2b";
       ctx.fillRect(0, y, c.width, rowH);
       ctx.fillStyle = "#2c2c40";
       ctx.fillRect(0, y + rowH - 1, c.width, 1);
@@ -79,25 +95,51 @@ export default function PianoRoll({
       ctx.fillStyle = i % 4 === 0 ? "#55557a" : "#2c2c40";
       ctx.fillRect(Math.round(t * pps), 0, 1, c.height);
     });
+
     for (const n of track.notes) {
       const row = pitchToRow(n.pitch);
       if (row < 0 || row >= rows) continue;
+      const sel = selSet.has(n.id);
       const x = n.start * pps;
+      const w = Math.max(clips ? 4 : drums ? 8 : 3, n.duration * pps);
+
+      if (clips) {
+        ctx.fillStyle = sel ? "#ffffff30" : color + "33";
+        ctx.fillRect(x, 4, w, rowH - 8);
+        if (peaks) {
+          const src = n.src ?? n.start;
+          ctx.fillStyle = sel ? "#ffffff" : color;
+          const mid = rowH / 2;
+          for (let px = 0; px < w; px++) {
+            const h = peakAt(peaks, src + px / pps, 1 / pps) * (rowH - 20);
+            ctx.fillRect(x + px, mid - h / 2, 1, Math.max(1, h));
+          }
+        }
+        ctx.strokeStyle = sel ? "#ffffff" : color;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x + 1, 5, w - 2, rowH - 10);
+        ctx.fillStyle = sel ? "#ffffff" : color;
+        ctx.fillRect(x, 4, 4, rowH - 8);
+        ctx.fillRect(x + w - 4, 4, 4, rowH - 8);
+        continue;
+      }
+
       const y = row * rowH + (drums ? 6 : 1);
-      const w = Math.max(drums ? 6 : 3, n.duration * pps);
+      const h = rowH - (drums ? 12 : 2);
       ctx.globalAlpha = 0.5 + 0.5 * n.velocity;
-      ctx.fillStyle = selSet.has(n.id) ? "#ffffff" : color;
-      ctx.fillRect(x, y, w, rowH - (drums ? 12 : 2));
+      ctx.fillStyle = sel ? "#ffffff" : color;
+      ctx.fillRect(x, y, w, h);
       ctx.globalAlpha = 1;
-      if (!drums && w > 10) {
-        ctx.fillStyle = "#00000066";
-        ctx.fillRect(x + w - 3, y, 3, rowH - 2);
+      if (w > 12) {
+        ctx.fillStyle = "#00000077";
+        ctx.fillRect(x + w - 4, y, 4, h);
       }
     }
     ctx.globalAlpha = 1;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [track.notes, selSet, pps, beats, low, high, width, height, color, drums]);
+  }, [track.notes, selSet, pps, beats, low, high, width, height, color, drums, clips, peaks]);
 
+  // ----- régua -----
   useEffect(() => {
     const c = rulerRef.current;
     if (!c) return;
@@ -118,6 +160,26 @@ export default function PianoRoll({
     });
   }, [beats, pps, width]);
 
+  // ----- forma de onda do instrumento (para conferir os blocos) -----
+  useEffect(() => {
+    const c = waveRef.current;
+    if (!c) return;
+    const ctx = c.getContext("2d")!;
+    ctx.fillStyle = "#0f0f17";
+    ctx.fillRect(0, 0, c.width, c.height);
+    if (!peaks) return;
+    ctx.fillStyle = color;
+    const mid = WAVE_H / 2;
+    for (let px = 0; px < c.width; px++) {
+      const h = peakAt(peaks, px / pps, 1 / pps) * (WAVE_H - 6);
+      ctx.fillRect(px, mid - h / 2, 1, Math.max(1, h));
+    }
+    ctx.fillStyle = "#ffffff22";
+    beats.forEach((t, i) => {
+      if (i % 4 === 0) ctx.fillRect(Math.round(t * pps), 0, 1, WAVE_H);
+    });
+  }, [peaks, pps, width, color, beats]);
+
   useEffect(() => {
     if (!follow) return;
     const el = scrollRef.current;
@@ -126,13 +188,24 @@ export default function PianoRoll({
     if (x > el.scrollLeft + el.clientWidth - 60 || x < el.scrollLeft + KEY_W) el.scrollLeft = Math.max(0, position * pps - 80);
   }, [position, follow, pps]);
 
+  // ----- teclado: Delete remove, Ctrl+D duplica -----
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!selectedIds.length || (e.key !== "Delete" && e.key !== "Backspace")) return;
+      if (!selectedIds.length) return;
       if ((e.target as HTMLElement).tagName === "INPUT") return;
-      onBegin();
-      onChange(track.notes.filter((n) => !selSet.has(n.id)));
-      onSelect([]);
+      if (e.key === "Delete" || e.key === "Backspace") {
+        onBegin();
+        onChange(track.notes.filter((n) => !selSet.has(n.id)));
+        onSelect([]);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        onBegin();
+        const copies = track.notes
+          .filter((n) => selSet.has(n.id))
+          .map((n) => ({ ...n, id: crypto.randomUUID(), src: clips ? n.src ?? n.start : n.src, start: n.start + (clips ? n.duration : grid * 4) }));
+        onChange([...track.notes, ...copies]);
+        onSelect(copies.map((n) => n.id));
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -145,9 +218,16 @@ export default function PianoRoll({
     return { x, y, t: x / pps, r: Math.floor(y / rowH) };
   };
   const hit = (t: number, r: number) =>
-    [...track.notes].reverse().find((n) => pitchToRow(n.pitch) === r && t >= n.start && t <= n.start + Math.max(n.duration, 6 / pps));
-  const inResizeZone = (n: Note, t: number) => !drums && n.duration * pps > 10 && t >= n.start + n.duration - Math.min(6 / pps, n.duration / 2);
-  const ping = (pitch: number) => preview(track.id, pitch, drums);
+    [...track.notes].reverse().find((n) => pitchToRow(n.pitch) === r && t >= n.start && t <= n.start + Math.max(n.duration, 8 / pps));
+  const zoneOf = (n: Note, t: number): DragType => {
+    const z = Math.min(8 / pps, n.duration / 3);
+    if (t >= n.start + n.duration - z) return "right";
+    if (clips && t <= n.start + z) return "left";
+    return "move";
+  };
+  const ping = (pitch: number) => {
+    if (!clips) preview(track.id, pitch, drums);
+  };
 
   const onDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -160,23 +240,31 @@ export default function PianoRoll({
     const n = hit(L.t, L.r);
     if (n) {
       const multi = selSet.has(n.id) && selectedIds.length > 1;
+      const type = multi ? "move" : zoneOf(n, L.t);
       const members = multi ? track.notes.filter((x) => selSet.has(x.id)) : [n];
       if (!multi) onSelect([n.id]);
-      const type = !multi && inResizeZone(n, L.t) ? "resize" : "move";
       drag.current = {
-        type, anchor: n.id, offset: L.t - n.start, startRow: pitchToRow(n.pitch),
+        type, anchor: n.id, init: n, offset: L.t - n.start, startRow: pitchToRow(n.pitch),
         group: members.map((m) => ({ id: m.id, start: m.start, row: pitchToRow(m.pitch) })),
         began: false, lastPitch: n.pitch,
       };
-      setCursor(type === "resize" ? "ew-resize" : "grabbing");
+      setCursor(type === "move" ? "grabbing" : "ew-resize");
       if (type === "move") ping(n.pitch);
+    } else if (clips) {
+      onSelect([]);
     } else {
       onBegin();
       const pitch = rowToPitch(L.r);
-      const note: Note = { id: crypto.randomUUID(), pitch, start: Math.max(0, snap(L.t)), duration: drums ? 0.1 : grid * 4, velocity: 0.8 };
+      const note: Note = {
+        id: crypto.randomUUID(), pitch, start: Math.max(0, snapT(L.t)),
+        duration: drums ? DRUM_DUR[pitch] : grid * 4, velocity: 0.8,
+      };
       onChange([...track.notes, note]);
       onSelect([note.id]);
-      drag.current = { type: "move", anchor: note.id, offset: 0, startRow: clampRow(L.r), group: [{ id: note.id, start: note.start, row: clampRow(L.r) }], began: true, lastPitch: pitch };
+      drag.current = {
+        type: "move", anchor: note.id, init: note, offset: 0, startRow: clampRow(L.r),
+        group: [{ id: note.id, start: note.start, row: clampRow(L.r) }], began: true, lastPitch: pitch,
+      };
       ping(pitch);
     }
   };
@@ -191,20 +279,26 @@ export default function PianoRoll({
     const d = drag.current;
     if (!d) {
       const n = hit(L.t, L.r);
-      setCursor(n ? (inResizeZone(n, L.t) ? "ew-resize" : "grab") : "crosshair");
+      setCursor(n ? (zoneOf(n, L.t) === "move" ? "grab" : "ew-resize") : clips ? "default" : "crosshair");
       return;
     }
     const anchor = track.notes.find((n) => n.id === d.anchor);
     if (!anchor) return;
+    const init = d.init;
 
     let updated: Note[];
-    let anchorNext: Note;
-    if (d.type === "resize") {
-      anchorNext = { ...anchor, duration: Math.max(grid, snap(L.t) - anchor.start) };
-      updated = track.notes.map((n) => (n.id === d.anchor ? anchorNext : n));
+    let next: Note;
+    if (d.type === "right") {
+      next = { ...anchor, duration: Math.max(minDur, snapT(L.t) - init.start) };
+      updated = track.notes.map((n) => (n.id === d.anchor ? next : n));
+    } else if (d.type === "left") {
+      const end = init.start + init.duration;
+      const ns = Math.min(Math.max(0, snapT(L.t)), end - minDur);
+      next = { ...anchor, start: ns, src: (init.src ?? init.start) + (ns - init.start), duration: end - ns };
+      updated = track.notes.map((n) => (n.id === d.anchor ? next : n));
     } else {
       const g0 = d.group.find((g) => g.id === d.anchor)!;
-      const dt = Math.max(0, snap(L.t - d.offset)) - g0.start;
+      const dt = Math.max(0, snapT(L.t - d.offset)) - g0.start;
       const dRow = L.r - d.startRow;
       const map = new Map(d.group.map((g) => [g.id, g]));
       updated = track.notes.map((n) => {
@@ -212,16 +306,16 @@ export default function PianoRoll({
         if (!g) return n;
         return { ...n, start: Math.max(0, g.start + dt), pitch: rowToPitch(g.row + dRow) };
       });
-      anchorNext = updated.find((n) => n.id === d.anchor)!;
+      next = updated.find((n) => n.id === d.anchor)!;
     }
-    if (anchorNext.start === anchor.start && anchorNext.pitch === anchor.pitch && anchorNext.duration === anchor.duration) return;
+    if (next.start === anchor.start && next.pitch === anchor.pitch && next.duration === anchor.duration) return;
     if (!d.began) {
       onBegin();
       d.began = true;
     }
-    if (anchorNext.pitch !== d.lastPitch) {
-      ping(anchorNext.pitch);
-      d.lastPitch = anchorNext.pitch;
+    if (next.pitch !== d.lastPitch) {
+      ping(next.pitch);
+      d.lastPitch = next.pitch;
     }
     onChange(updated);
   };
@@ -245,7 +339,7 @@ export default function PianoRoll({
       setMarq(null);
     }
     drag.current = null;
-    setCursor("crosshair");
+    setCursor(clips ? "default" : "crosshair");
   };
 
   const onContext = (e: React.MouseEvent) => {
@@ -266,21 +360,31 @@ export default function PianoRoll({
 
   return (
     <div className="roll-scroll" ref={scrollRef}>
-      <div className="ruler-row">
+      <div className="ruler-row" style={{ top: 0 }}>
         <div className="ruler-corner" style={{ width: KEY_W, height: RULER_H }} />
         <div className="ruler-wrap" style={{ width, height: RULER_H }}>
           <canvas ref={rulerRef} width={width} height={RULER_H} style={{ cursor: "pointer" }} onMouseDown={onRuler} title="Clique para mover o ponto de reprodução" />
           <div className="playhead" style={{ left: position * pps }} />
         </div>
       </div>
+      {!clips && (
+        <div className="ruler-row" style={{ top: RULER_H, zIndex: 3 }}>
+          <div className="ruler-corner wave-label" style={{ width: KEY_W, height: WAVE_H }}>Áudio</div>
+          <div className="ruler-wrap" style={{ width, height: WAVE_H }}>
+            <canvas ref={waveRef} width={width} height={WAVE_H} onMouseDown={onRuler} style={{ cursor: "pointer" }} />
+            <div className="playhead" style={{ left: position * pps }} />
+          </div>
+        </div>
+      )}
       <div className="roll-inner" style={{ height }}>
         <div className="keys" style={{ width: KEY_W }}>
           {Array.from({ length: rows }, (_, i) => {
             const p = rowToPitch(i);
-            const black = !drums && BLACK.has(p % 12);
+            const black = !drums && !clips && BLACK.has(p % 12);
+            const label = drums ? DRUM_LABELS[p] : clips ? "Frases" : p % 12 === 0 ? `${NAMES[0]}${Math.floor(p / 12) - 1}` : "";
             return (
               <div key={i} className={black ? "key black" : "key"} style={{ height: rowH, lineHeight: `${rowH}px` }}>
-                {drums ? DRUM_LABELS[p] : p % 12 === 0 ? `${NAMES[0]}${Math.floor(p / 12) - 1}` : ""}
+                {label}
               </div>
             );
           })}

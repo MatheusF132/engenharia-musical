@@ -73,3 +73,5 @@ button:focus-visible, input:focus-visible, label:focus-within { outline: 2px sol
 .ruler-wrap { position: relative; flex: none; border-bottom: 1px solid #2a2a3c; }
 .ruler-wrap canvas { display: block; }
 .marquee { position: absolute; border: 1px dashed #fff; background: #ffffff22; pointer-events: none; }
+.wave-label { font-size: 10px; color: #8a8aad; display: flex; align-items: center; justify-content: center; letter-spacing: .04em; }
+.type-select { background: #1d1d2e; color: #ececf5; border: 1px solid #3a3a55; border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer; }

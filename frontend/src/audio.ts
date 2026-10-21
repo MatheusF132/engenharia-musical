@@ -1,22 +1,26 @@
 import * as Tone from "tone";
 import type { Note, Track } from "./types";
 
+export type Mode = "audio" | "notes";
 export type Edit = { removed: Note[]; added: Note[]; kept: Note[] };
 export type PlayTrack = Track & { edit: Edit };
 
-export type Mode = "audio" | "notes";
+type Iv = [number, number];
+type P = { value: any; rampTo: (v: any, r: any, t?: any) => unknown };
 
 let parts: Tone.Part<any>[] = [];
 let nodes: Tone.ToneAudioNode[] = [];
 const vols = new Map<string, Tone.Volume>();
 const cache = new Map<string, Tone.ToneAudioBuffer>();
-let token = 0;
-let pv: Tone.PolySynth | null = null;
+const peaksCache = new Map<string, Float32Array>();
 const banks = new Map<string, Record<string, AudioBuffer>>();
 const previewers = new Map<string, Tone.Sampler>();
+let token = 0;
+let pv: Tone.PolySynth | null = null;
 
 const WAVE: Record<string, "sine" | "triangle" | "square" | "sawtooth"> = {
-  bass: "sawtooth", vocals: "sine", guitar: "square", piano: "triangle", other: "sawtooth", mix: "triangle",
+  bass808: "sine", bass: "sawtooth", lead: "sawtooth", pad: "triangle", keys: "triangle", piano: "triangle",
+  pluck: "square", bell: "sine", strings: "sawtooth", guitar: "square", fx: "sawtooth", other: "triangle", mix: "triangle",
 };
 
 /** Slider 0..100 (80 = 0 dB) para decibéis. */
@@ -33,6 +37,44 @@ export function seek(t: number) {
 export function getPosition() {
   return Tone.Transport.seconds;
 }
+
+async function load(url: string) {
+  let buf = cache.get(url);
+  if (!buf) {
+    buf = await Tone.ToneAudioBuffer.fromUrl(url);
+    cache.set(url, buf);
+  }
+  return buf;
+}
+
+/** Forma de onda (100 pontos por segundo, 0..1) para conferir o que cada bloco representa. */
+export async function getPeaks(url: string): Promise<Float32Array> {
+  const hit = peaksCache.get(url);
+  if (hit) return hit;
+  const buf = (await load(url)).get() as AudioBuffer;
+  const per = Math.max(1, Math.floor(buf.sampleRate / 100));
+  const n = Math.ceil(buf.length / per);
+  const out = new Float32Array(n);
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < n; i++) {
+      let m = 0;
+      const end = Math.min(buf.length, (i + 1) * per);
+      for (let j = i * per; j < end; j++) {
+        const v = Math.abs(d[j]);
+        if (v > m) m = v;
+      }
+      if (m > out[i]) out[i] = m;
+    }
+  }
+  const sorted = Float32Array.from(out).sort();
+  const ref = sorted[Math.floor(sorted.length * 0.99)] || 1;
+  for (let i = 0; i < n; i++) out[i] = Math.min(1, out[i] / ref);
+  peaksCache.set(url, out);
+  return out;
+}
+
+// ---------- amostras extraídas da própria música ----------
 
 function sliceBuffer(buf: AudioBuffer, start: number, len: number): AudioBuffer {
   const sr = buf.sampleRate;
@@ -54,7 +96,6 @@ function sliceBuffer(buf: AudioBuffer, start: number, len: number): AudioBuffer 
   return out;
 }
 
-/** Monta o "instrumento" a partir das próprias notas da música: uma amostra por faixa de altura. */
 function melodicBank(buf: AudioBuffer, notes: Note[]) {
   const overlaps = (n: Note) =>
     notes.reduce((c, m) => (m !== n && m.start < n.start + n.duration && m.start + m.duration > n.start ? c + 1 : c), 0);
@@ -73,16 +114,15 @@ function melodicBank(buf: AudioBuffer, notes: Note[]) {
   return urls;
 }
 
-/** Kit de bateria extraído da música: a melhor batida limpa de cada tipo. */
 function drumBank(buf: AudioBuffer, notes: Note[]) {
   const urls: Record<string, AudioBuffer> = {};
-  const spec: [number, number][] = [[36, 0.4], [38, 0.3], [42, 0.15]];
+  const spec: [number, number][] = [[36, 0.6], [38, 0.4], [42, 0.2]];
   for (const [pitch, len] of spec) {
     let best: Note | null = null;
     let bestScore = -Infinity;
     for (const h of notes.filter((n) => n.pitch === pitch)) {
-      const others = notes.filter((o) => o !== h && Math.abs(o.start - h.start) < 0.08).length;
-      const sc = h.velocity - 0.4 * others;
+      const others = notes.filter((o) => o !== h && Math.abs(o.start - h.start) < 0.1).length;
+      const sc = h.velocity - 0.5 * others;
       if (sc > bestScore) {
         best = h;
         bestScore = sc;
@@ -93,16 +133,14 @@ function drumBank(buf: AudioBuffer, notes: Note[]) {
   return urls;
 }
 
-/** Carrega o áudio do instrumento e extrai dele as amostras usadas para tocar notas novas. */
-export async function prepareTrack(t: { id: string; audio: string | null; kind: "melodic" | "drums" }, notes: Note[]) {
-  if (!t.audio || banks.has(t.id) || notes.length === 0) return;
+export async function prepareTrack(t: { id: string; audio: string | null; kind: string }, notes: Note[]) {
+  if (!t.audio || t.kind === "clips" || banks.has(t.id) || notes.length === 0) return;
   const buf = (await load(t.audio)).get() as AudioBuffer | undefined;
   if (!buf) return;
   const urls = t.kind === "drums" ? drumBank(buf, notes) : melodicBank(buf, notes);
   if (Object.keys(urls).length) banks.set(t.id, urls);
 }
 
-/** Toca a nota ao criar ou mover, com o som do próprio instrumento da música. */
 export function preview(trackId: string, pitch: number, drums: boolean) {
   if (Tone.getContext().state !== "running") {
     void Tone.start();
@@ -116,7 +154,7 @@ export function preview(trackId: string, pitch: number, drums: boolean) {
       previewers.set(trackId, s);
     }
     const note = Tone.Frequency(pitch, "midi").toNote();
-    if (drums) s.triggerAttack(note);
+    if (drums) s.triggerAttackRelease(note, 0.3);
     else s.triggerAttackRelease(note, 0.5);
     return;
   }
@@ -127,15 +165,25 @@ export function preview(trackId: string, pitch: number, drums: boolean) {
   pv.triggerAttackRelease(Tone.Frequency(pitch, "midi").toFrequency(), 0.2);
 }
 
-export function stop() {
-  token++;
+// ---------- ciclo de vida ----------
+
+function teardown() {
   Tone.Transport.stop();
   Tone.Transport.cancel();
-  parts.forEach((p) => p.dispose());
-  nodes.forEach((n) => n.dispose());
+  for (const p of parts) {
+    try { p.dispose(); } catch { /* já descartado */ }
+  }
+  for (const n of nodes) {
+    try { n.dispose(); } catch { /* já descartado */ }
+  }
   parts = [];
   nodes = [];
   vols.clear();
+}
+
+export function stop() {
+  token++;
+  teardown();
 }
 
 export function clearCache() {
@@ -143,21 +191,12 @@ export function clearCache() {
   previewers.forEach((p) => p.dispose());
   previewers.clear();
   banks.clear();
+  peaksCache.clear();
   cache.forEach((b) => b.dispose());
   cache.clear();
 }
 
-async function load(url: string) {
-  let buf = cache.get(url);
-  if (!buf) {
-    buf = await Tone.ToneAudioBuffer.fromUrl(url);
-    cache.set(url, buf);
-  }
-  return buf;
-}
-
-type Iv = [number, number];
-type P = { value: any; rampTo: (v: any, r: any, t?: any) => unknown };
+// ---------- remoção de trechos do áudio original ----------
 
 function mergeIntervals(iv: Iv[]): Iv[] {
   const sorted = [...iv].sort((a, b) => a[0] - b[0]);
@@ -170,46 +209,52 @@ function mergeIntervals(iv: Iv[]): Iv[] {
   return out;
 }
 
-/** Liga/desliga um efeito em janelas de tempo, respeitando o ponto onde a reprodução começa. */
-function windows(iv: Iv[], startAt: number, apply: (on: boolean, t: number | null) => void) {
+function windows(iv: Iv[], from: number, apply: (on: boolean, t: number | null) => void) {
   for (const [s, e] of mergeIntervals(iv)) {
-    if (e <= startAt) continue;
-    if (s <= startAt) apply(true, null);
+    if (e <= from) continue;
+    if (s <= from) apply(true, null);
     else Tone.Transport.schedule((t) => apply(true, t), s);
     Tone.Transport.schedule((t) => apply(false, t), e);
   }
 }
 
-const setParam = (p: P, v: number, t: number | null) => (t === null ? void (p.value = v) : void p.rampTo(v, 0.015, t));
+const setParam = (p: P, v: number, t: number | null, ramp: number) => (t === null ? void (p.value = v) : void p.rampTo(v, ramp, t));
 
-/**
- * Tira do áudio do instrumento só as notas apagadas ou movidas:
- * - nota sozinha no momento: abaixa o áudio da faixa naquele trecho;
- * - nota junto com outras: filtros que cortam a frequência da nota e seus harmônicos;
- * - bateria: corta só a faixa de frequência daquele tipo de batida.
- */
-function cutFilters(track: PlayTrack, startAt: number): Tone.ToneAudioNode[] {
+function cutFilters(track: PlayTrack, from: number): Tone.ToneAudioNode[] {
   const out: Tone.ToneAudioNode[] = [];
   const { removed, kept } = track.edit;
   if (!removed.length) return out;
   const end = (n: Note) => n.start + n.duration;
 
+  const duckNode = (iv: Iv[]) => {
+    const g = new Tone.Gain(1);
+    windows(iv, from, (on, t) => setParam(g.gain, on ? 0 : 1, t, on ? 0.008 : 0.025));
+    out.push(g);
+  };
+
+  // frase de vocal: silencia exatamente o trecho removido
+  if (track.kind === "clips") {
+    duckNode(removed.map((r) => [r.start - 0.005, end(r) + 0.005] as Iv));
+    return out;
+  }
+
   if (track.kind === "drums") {
     const iv: Record<string, Iv[]> = { kick: [], snare: [], hat: [] };
     for (const n of removed) {
       const k = n.pitch === 36 ? "kick" : n.pitch === 38 ? "snare" : "hat";
-      iv[k].push([n.start - 0.01, n.start + (k === "hat" ? 0.06 : 0.12)]);
+      const tail = k === "hat" ? 0.05 : k === "snare" ? 0.11 : 0.14;
+      iv[k].push([n.start - 0.006, n.start + Math.max(tail, Math.min(n.duration, 0.4))]);
     }
     const specs: Record<string, { type: BiquadFilterType; f: number; g: number; q: number }[]> = {
-      kick: [{ type: "lowshelf", f: 150, g: -24, q: 1 }],
-      snare: [{ type: "peaking", f: 1000, g: -18, q: 0.5 }, { type: "peaking", f: 200, g: -12, q: 1 }],
-      hat: [{ type: "highshelf", f: 6000, g: -24, q: 1 }],
+      kick: [{ type: "lowshelf", f: 160, g: -30, q: 1 }],
+      snare: [{ type: "peaking", f: 1800, g: -20, q: 0.45 }, { type: "peaking", f: 220, g: -12, q: 1 }],
+      hat: [{ type: "highshelf", f: 6500, g: -30, q: 1 }],
     };
     for (const k of Object.keys(iv)) {
       if (!iv[k].length) continue;
       for (const sp of specs[k]) {
         const f = new Tone.Filter({ type: sp.type, frequency: sp.f, Q: sp.q, gain: 0 });
-        windows(iv[k], startAt, (on, t) => setParam(f.gain, on ? sp.g : 0, t));
+        windows(iv[k], from, (on, t) => setParam(f.gain, on ? sp.g : 0, t, on ? 0.004 : 0.02));
         out.push(f);
       }
     }
@@ -218,11 +263,10 @@ function cutFilters(track: PlayTrack, startAt: number): Tone.ToneAudioNode[] {
 
   const duck: Iv[] = [];
   const byPitch = new Map<number, Iv[]>();
-  const mono = track.instrument === "vocals" || track.instrument === "bass";
+  const mono = track.instrument === "bass" || track.instrument === "bass808";
   const segs = track.segments ?? [];
   for (const r of removed) {
     if (mono) {
-      // vale o trecho inteiro em que o instrumento soa (respiração, reverb), até a próxima nota mantida
       const re = end(r);
       let prevEnd = -Infinity;
       let nextStart = Infinity;
@@ -261,17 +305,15 @@ function cutFilters(track: PlayTrack, startAt: number): Tone.ToneAudioNode[] {
     const f0 = 440 * 2 ** ((pitch - 69) / 12);
     for (const [k, db] of [[1, -26], [2, -20], [3, -14]] as const) {
       const f = new Tone.Filter({ type: "peaking", frequency: f0 * k, Q: 10, gain: 0 });
-      windows(iv, startAt, (on, t) => setParam(f.gain, on ? db : 0, t));
+      windows(iv, from, (on, t) => setParam(f.gain, on ? db : 0, t, 0.015));
       out.push(f);
     }
   }
-  if (duck.length) {
-    const g = new Tone.Gain(1);
-    windows(duck, startAt, (on, t) => setParam(g.gain, on ? 0 : 1, t));
-    out.push(g);
-  }
+  if (duck.length) duckNode(duck);
   return out;
 }
+
+// ---------- notas novas e modo "notas" ----------
 
 function synthPart(track: Track, notes: Note[], vol: Tone.Volume) {
   const events = notes.map((n) => [n.start, n] as [number, Note]);
@@ -281,8 +323,7 @@ function synthPart(track: Track, notes: Note[], vol: Tone.Volume) {
     nodes.push(sampler);
     const part = new Tone.Part<any>((time: number, n: Note) => {
       const note = Tone.Frequency(n.pitch, "midi").toNote();
-      if (track.kind === "drums") sampler.triggerAttack(note, time, n.velocity);
-      else sampler.triggerAttackRelease(note, Math.max(n.duration, 0.08), time, n.velocity);
+      sampler.triggerAttackRelease(note, Math.max(n.duration, 0.05), time, n.velocity);
     }, events);
     part.start(0);
     parts.push(part);
@@ -301,20 +342,27 @@ function synthPart(track: Track, notes: Note[], vol: Tone.Volume) {
     }, events);
     part.start(0);
     parts.push(part);
-  } else {
-    const wave = WAVE[track.instrument] ?? "triangle";
-    const synth = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: wave },
-      envelope: { attack: 0.01, release: 0.2 },
-    }).connect(vol);
-    synth.volume.value = wave === "sawtooth" || wave === "square" ? -20 : -10;
-    nodes.push(synth);
-    const part = new Tone.Part<any>((time: number, n: Note) => {
-      const freq = Tone.Frequency(n.pitch, "midi").toFrequency();
-      synth.triggerAttackRelease(freq, Math.max(n.duration, 0.05), time, n.velocity);
-    }, events);
-    part.start(0);
-    parts.push(part);
+    return;
+  }
+  const wave = WAVE[track.instrument] ?? "triangle";
+  const synth = new Tone.PolySynth(Tone.Synth, { oscillator: { type: wave }, envelope: { attack: 0.01, release: 0.2 } }).connect(vol);
+  synth.volume.value = wave === "sawtooth" || wave === "square" ? -20 : -10;
+  nodes.push(synth);
+  const part = new Tone.Part<any>((time: number, n: Note) => {
+    synth.triggerAttackRelease(Tone.Frequency(n.pitch, "midi").toFrequency(), Math.max(n.duration, 0.05), time, n.velocity);
+  }, events);
+  part.start(0);
+  parts.push(part);
+}
+
+/** Frases de vocal copiadas ou movidas: tocam o trecho do áudio original no novo lugar. */
+function clipPlayers(clips: Note[], buf: Tone.ToneAudioBuffer, vol: Tone.Volume) {
+  for (const c of clips) {
+    const p = new Tone.Player(buf).connect(vol);
+    p.fadeIn = 0.01;
+    p.fadeOut = 0.02;
+    p.sync().start(c.start, c.src ?? c.start, c.duration);
+    nodes.push(p);
   }
 }
 
@@ -325,19 +373,12 @@ export async function play(
   solo: string | null,
   originalUrl: string,
   volumes: Record<string, number>,
-  startAt: number
+  startAt: number | null
 ): Promise<boolean> {
   await Tone.start();
-  stop();
-  const my = token;
+  const my = ++token;
   const on = (id: string) => (solo ? solo === id : !muted.has(id));
-  const useAudio = (t: Track) => modes[t.id] === "audio" && !!t.audio;
-  const volFor = (id: string) => {
-    const v = new Tone.Volume(toDb(volumes[id] ?? 80)).toDestination();
-    vols.set(id, v);
-    nodes.push(v);
-    return v;
-  };
+  const useAudio = (t: Track) => (modes[t.id] === "audio" || t.kind === "clips") && !!t.audio;
 
   const audible = tracks.filter((t) => on(t.id));
   const urls = new Set(audible.filter(useAudio).map((t) => t.audio as string));
@@ -347,20 +388,33 @@ export async function play(
   await Promise.all([
     ...[...urls].map(async (u) => buffers.set(u, await load(u))),
     ...audible
-      .filter((t) => !useAudio(t) || t.edit.added.length > 0)
+      .filter((t) => !useAudio(t) || (t.kind !== "clips" && t.edit.added.length > 0))
       .map((t) => prepareTrack(t, [...t.edit.kept, ...t.edit.removed])),
   ]);
   if (my !== token) return false;
 
+  // a troca do grafo é síncrona: não há "buraco" nem volta no tempo ao editar durante a reprodução
+  const from = startAt ?? (Tone.Transport.state === "started" ? Tone.Transport.seconds : 0);
+  teardown();
+
+  const volFor = (id: string) => {
+    const v = new Tone.Volume(toDb(volumes[id] ?? 80)).toDestination();
+    vols.set(id, v);
+    nodes.push(v);
+    return v;
+  };
+
   for (const t of audible) {
     const vol = volFor(t.id);
     if (useAudio(t)) {
-      const player = new Tone.Player(buffers.get(t.audio as string)!);
-      const cuts = cutFilters(t, startAt);
+      const buf = buffers.get(t.audio as string)!;
+      const player = new Tone.Player(buf);
+      const cuts = cutFilters(t, from);
       player.chain(...cuts, vol);
       player.sync().start(0);
       nodes.push(player, ...cuts);
-      if (t.edit.added.length) synthPart(t, t.edit.added, vol);
+      if (t.kind === "clips") clipPlayers(t.edit.added, buf, vol);
+      else if (t.edit.added.length) synthPart(t, t.edit.added, vol);
     } else {
       synthPart(t, t.notes, vol);
     }
@@ -371,7 +425,7 @@ export async function play(
     nodes.push(player);
   }
 
-  Tone.Transport.seconds = startAt;
+  Tone.Transport.seconds = from;
   Tone.Transport.start();
   return true;
 }

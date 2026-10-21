@@ -1,5 +1,14 @@
-export type Note = { id: string; pitch: number; start: number; duration: number; velocity: number };
-export type Track = { id: string; name: string; instrument: string; kind: "melodic" | "drums"; audio: string | null; segments?: [number, number][]; notes: Note[] };
+export type Note = { id: string; pitch: number; start: number; duration: number; velocity: number; src?: number };
+export type Kind = "melodic" | "drums" | "clips";
+export type Track = {
+  id: string;
+  name: string;
+  instrument: string;
+  kind: Kind;
+  audio: string | null;
+  segments?: [number, number][];
+  notes: Note[];
+};
 export type Project = {
   name: string;
   bpm: number;
